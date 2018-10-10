@@ -1891,6 +1891,11 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 			    .help = "HTTP (WebDAV/S3) IO engine",
 			  },
 #endif
+#ifdef CONFIG_LIBZBC
+			  { .ival = "libzbc",
+			    .help = "libzbc based IO engine",
+			  },
+#endif
 		},
 	},
 	{
