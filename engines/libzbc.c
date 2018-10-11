@@ -14,6 +14,7 @@
 
 struct libzbc_data {
 	struct zbc_device *zdev;
+	struct zbc_device_info info;
 };
 
 struct libzbc_options {
@@ -24,7 +25,7 @@ struct libzbc_options {
 
 static struct fio_option options[] = {
 	{
-		.name	= "ata",
+		.name	= "libzbc_ata",
 		.lname	= "libzbc ATA driver",
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct libzbc_options, force_ata),
@@ -34,10 +35,10 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_LIBZBC,
 	},
 	{
-		.name	= "debug",
+		.name	= "libzbc_debug",
 		.lname	= "libzbc debug",
 		.type	= FIO_OPT_BOOL,
-		.off1	= offsetof(struct libzbc_options, force_ata),
+		.off1	= offsetof(struct libzbc_options, libzbc_debug),
 		.help	= "turn on libzbc debug",
 		.def	= "0",
 		.category = FIO_OPT_C_ENGINE,
@@ -50,17 +51,6 @@ static struct fio_option options[] = {
 
 static int fio_libzbc_prep(struct thread_data fio_unused *td, struct io_u *io_u)
 {
-	struct fio_file *f = io_u->file;
-
-	if (io_u->ddir == DDIR_READ)
-		io_prep_pread(&io_u->iocb, f->fd, io_u->xfer_buf,
-			      io_u->xfer_buflen, io_u->offset);
-	else if (io_u->ddir == DDIR_WRITE)
-		io_prep_pwrite(&io_u->iocb, f->fd, io_u->xfer_buf,
-			       io_u->xfer_buflen, io_u->offset);
-	else if (ddir_sync(io_u->ddir))
-		io_prep_fsync(&io_u->iocb, f->fd);
-
 	return 0;
 }
 
@@ -111,49 +101,57 @@ static void fio_libzbc_cleanup(struct thread_data *td)
 		free(ld);
 }
 
-static int fio_libzbc_init(struct thread_data *td)
-{
-	struct libzbc_data *ld;
-
-	ld = calloc(1, sizeof(*ld));
-	if (!ld)
-		return -ENOMEM;
-
-	td->io_ops_data = ld;
-	return 0;
-}
-
-static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
+static int libzbc_setup(struct thread_data *td, struct fio_file *f,
+			struct libzbc_data **pld)
 {
 	struct libzbc_data *ld = td->io_ops_data;
 	struct libzbc_options *o = td->eo;
 	int rc, flags;
 
-	if (o->libzbc_debug)
-		zbc_set_log_level("debug");
+	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
+	if (!ld) {
+		ld = calloc(1, sizeof(*ld));
+		if (!ld)
+			return -ENOMEM;
 
-	dprint(FD_IO, "DEBUG fio_libzbc_open_file\n");
-	dprint(FD_IO, "f->io_size=%ld \n", f->io_size);
-	dprint(FD_IO, "td->o.size=%lld \n", td->o.size);
-	dprint(FD_IO, "libzbc_debug=%i\n", o->libzbc_debug);
-	dprint(FD_IO, "force_ata=%i\n", o->force_ata);
+		if (o->libzbc_debug)
+			zbc_set_log_level("debug");
 
-	if (!o->force_ata)
-		flags = ZBC_O_DRV_BLOCK | ZBC_O_DRV_SCSI | ZBC_O_DRV_ATA;
-	else
-		flags = ZBC_O_DRV_ATA;
-	rc = zbc_open(f->file_name, flags, &ld->zdev);
-	if (rc)
-		return rc;
+		dprint(FD_ZBD, "io_size=%ld\n", f->io_size);
+		dprint(FD_ZBD, "libzbc_debug=%i\n", o->libzbc_debug);
+		dprint(FD_ZBD, "force_ata=%i\n", o->force_ata);
 
-	FILE_SET_ENG_DATA(f, ld->zdev);
+		if (!o->force_ata)
+			flags = ZBC_O_DRV_BLOCK | ZBC_O_DRV_SCSI | ZBC_O_DRV_ATA;
+		else
+			flags = ZBC_O_DRV_ATA;
+		rc = zbc_open(f->file_name, flags, &ld->zdev);
+		if (rc)
+			return rc;
+
+		zbc_get_device_info(ld->zdev, &ld->info);
+		dprint(FD_ZBD, "zbd_vendor_id:%s\n", ld->info.zbd_vendor_id);
+
+		td->io_ops_data = ld;
+	}
+
+	FILE_SET_ENG_DATA(f, ld);
+	if (pld)
+		*pld = ld;
+
 	return 0;
+}
+
+static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
+{
+	return libzbc_setup(td, f, NULL);
 }
 
 static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 				 struct fio_file *f)
 {
-	struct zbc_device *zdev = FILE_ENG_DATA(f);
+	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	struct zbc_device *zdev = ld->zdev;
 
 	if (zdev)
 		zbc_close(zdev);
@@ -162,17 +160,39 @@ static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 	return 0;
 }
 
+static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
+{
+	struct libzbc_data *ld;
+	struct zbc_device_info *info;
+	int ret;
+
+	ret = libzbc_setup(td, f, &ld);
+	if (ret)
+		return ret;
+
+	info = &ld->info;
+	dprint(FD_ZBD, "libzbc_get_file_size(%s),ld=0x%p\n", f->file_name, ld);
+	dprint(FD_ZBD, "zbd_type: %s, zbd_model: %s\n",
+	       zbc_device_type_str(info->zbd_type),
+	       zbc_device_model_str(info->zbd_model));
+
+	f->real_file_size = info->zbd_sectors * 512;
+	fio_file_set_size_known(f);
+	dprint(FD_ZBD, "file_size(%s)=%luB\n", f->file_name, f->real_file_size);
+
+	return 0;
+}
+
 static struct ioengine_ops ioengine = {
 	.name			= "libzbc",
 	.version		= FIO_IOOPS_VERSION,
-	.init			= fio_libzbc_init,
 	.prep			= fio_libzbc_prep,
 	.queue			= fio_libzbc_queue,
 	.cleanup		= fio_libzbc_cleanup,
 	.open_file		= fio_libzbc_open_file,
 	.close_file		= fio_libzbc_close_file,
-	.get_file_size		= generic_get_file_size,
-	.flags			= FIO_SYNCIO |FIO_NOEXTEND,
+	.get_file_size		= fio_libzbc_get_file_size,
+	.flags			= FIO_SYNCIO | FIO_NOEXTEND,
 	.options		= options,
 	.option_struct_size	= sizeof(struct libzbc_options),
 };
