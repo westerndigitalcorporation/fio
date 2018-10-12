@@ -49,25 +49,23 @@ static struct fio_option options[] = {
 	},
 };
 
-static int fio_libzbc_prep(struct thread_data fio_unused *td, struct io_u *io_u)
-{
-	return 0;
-}
-
 static enum fio_q_status fio_libzbc_queue(struct thread_data *td,
 					  struct io_u *io_u)
 {
-	struct libzbc_data *ld = td->io_ops_data;
+	struct fio_file *f = io_u->file;
+	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	uint64_t offset;
+	size_t count;
 	int ret;
 
 	fio_ro_check(td, io_u);
 
+	offset = io_u->offset >> 9;
+	count = io_u->xfer_buflen >> 9;
 	if (io_u->ddir == DDIR_READ) {
-		ret = zbc_pread(ld->zdev, io_u->xfer_buf,
-				io_u->xfer_buflen, io_u->offset);
+		ret = zbc_pread(ld->zdev, io_u->xfer_buf, count, offset);
 	} else if (io_u->ddir == DDIR_WRITE) {
-		ret = zbc_pwrite(ld->zdev, io_u->xfer_buf,
-				 io_u->xfer_buflen, io_u->offset);
+		ret = zbc_pwrite(ld->zdev, io_u->xfer_buf, count, offset);
 	} else if (io_u->ddir == DDIR_TRIM) {
 		return FIO_Q_COMPLETED;
 	} else if (io_u->ddir == DDIR_DATASYNC) {
@@ -83,11 +81,15 @@ static enum fio_q_status fio_libzbc_queue(struct thread_data *td,
 		return FIO_Q_COMPLETED;
 	}
 
-	if (ret != io_u->xfer_buflen) {
-		log_err("Short %s, len=%llu, ret=%u\n",
-			io_u->ddir == DDIR_READ ? "read" : "write",
-			io_u->xfer_buflen, ret);
-		io_u->error = EIO;
+	if (ret != count) {
+		if (ret < 0) {
+			io_u->error = -ret;
+		} else {
+			log_err("Short %s, len=%lu, ret=%i\n",
+				io_u->ddir == DDIR_READ ? "read" : "write",
+				count, ret);
+			io_u->error = EIO;
+		}
 	}
 
 	return FIO_Q_COMPLETED;
@@ -109,6 +111,7 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f,
 	int rc, flags;
 
 	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
+	ld = FILE_SET_ENG_DATA(f, ld);
 	if (!ld) {
 		ld = calloc(1, sizeof(*ld));
 		if (!ld)
@@ -132,10 +135,9 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f,
 		zbc_get_device_info(ld->zdev, &ld->info);
 		dprint(FD_ZBD, "zbd_vendor_id:%s\n", ld->info.zbd_vendor_id);
 
-		td->io_ops_data = ld;
+		FILE_SET_ENG_DATA(f, ld);
 	}
 
-	FILE_SET_ENG_DATA(f, ld);
 	if (pld)
 		*pld = ld;
 
@@ -151,10 +153,12 @@ static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 				 struct fio_file *f)
 {
 	struct libzbc_data *ld = FILE_ENG_DATA(f);
-	struct zbc_device *zdev = ld->zdev;
 
-	if (zdev)
-		zbc_close(zdev);
+	if (!ld)
+		return 0;
+	if (ld->zdev)
+		zbc_close(ld->zdev);
+	free(ld);
 
 	FILE_SET_ENG_DATA(f, NULL);
 	return 0;
@@ -171,9 +175,8 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 		return ret;
 
 	info = &ld->info;
-	dprint(FD_ZBD, "libzbc_get_file_size(%s),ld=0x%p\n", f->file_name, ld);
-	dprint(FD_ZBD, "zbd_type: %s, zbd_model: %s\n",
-	       zbc_device_type_str(info->zbd_type),
+	dprint(FD_ZBD, "(%s)zbd_type: %s, zbd_model: %s\n",
+	       f->file_name, zbc_device_type_str(info->zbd_type),
 	       zbc_device_model_str(info->zbd_model));
 
 	f->real_file_size = info->zbd_sectors * 512;
@@ -186,7 +189,6 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 static struct ioengine_ops ioengine = {
 	.name			= "libzbc",
 	.version		= FIO_IOOPS_VERSION,
-	.prep			= fio_libzbc_prep,
 	.queue			= fio_libzbc_queue,
 	.cleanup		= fio_libzbc_cleanup,
 	.open_file		= fio_libzbc_open_file,
