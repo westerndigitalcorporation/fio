@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2018 Western Digital Corporation or its affiliates.
+ *
+ * This file is released under the GPL.
+ *
+ *
  * libzbc engine
  *
  * IO engine using libzbc library to talk to zoned devices.
@@ -11,6 +16,7 @@
 
 #include "../fio.h"
 #include "../optgroup.h"
+#include "../zbd.h"
 
 struct libzbc_data {
 	struct zbc_device *zdev;
@@ -120,7 +126,6 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f,
 		if (o->libzbc_debug)
 			zbc_set_log_level("debug");
 
-		dprint(FD_ZBD, "io_size=%ld\n", f->io_size);
 		dprint(FD_ZBD, "libzbc_debug=%i\n", o->libzbc_debug);
 		dprint(FD_ZBD, "force_ata=%i\n", o->force_ata);
 
@@ -140,6 +145,30 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f,
 
 	if (pld)
 		*pld = ld;
+
+	return 0;
+}
+
+static int libzbc_reset_zones(struct thread_data *td, struct fio_file *f,
+			      uint64_t offset, uint64_t length)
+{
+	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	int i, ret;
+
+	offset >>= 9;
+	length >>= 9;
+
+	/* FIXME add option to use non-zero zone
+	 * count to reset all zones at once */
+	for (i = 0; i < length; i++, offset += td->o.zone_size) {
+		ret = zbc_reset_zone(ld->zdev, offset, 0);
+		if (ret) {
+			td_verror(td, errno, "resetting wp failed");
+			log_err("%s: resetting wp for sector %lu failed (%d).\n",
+				f->file_name, offset, errno);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -167,8 +196,12 @@ static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 {
 	struct libzbc_data *ld;
+	struct libzbc_options *o = td->eo;
 	struct zbc_device_info *info;
-	int ret;
+	struct zbc_zone *zones = NULL, *z;
+	struct fio_zone_info *p;
+	unsigned int nr_zones;
+	int i, ret;
 
 	ret = libzbc_setup(td, f, &ld);
 	if (ret)
@@ -181,7 +214,51 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 
 	f->real_file_size = info->zbd_sectors * 512;
 	fio_file_set_size_known(f);
-	dprint(FD_ZBD, "file_size(%s)=%luB\n", f->file_name, f->real_file_size);
+	dprint(FD_ZBD, "file_size(%s)=%luB\n",
+	       f->file_name, f->real_file_size);
+
+	if (info->zbd_model == ZBC_DM_HOST_MANAGED ||
+	    info->zbd_model == ZBC_DM_HOST_AWARE) {
+
+		ret = zbc_list_zones(ld->zdev, 0LL, ZBC_RZ_RO_ALL,
+				     &zones, &nr_zones);
+		if (ret || !zones) {
+			log_err("%s: REPORT ZONES failed, err=%i\n",
+				f->file_name, ret);
+			return ret;
+		}
+		td->o.zone_size = zones->zbz_length << 9;
+		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB\n",
+		       f->file_name, nr_zones, td->o.zone_size);
+
+		ret = zbd_init_zone_info(td, f, nr_zones);
+		if (ret) {
+			free(zones);
+			return ret;
+		}
+
+		p = f->zbd_info->zone_info;
+		for (i = 0, z = zones; i < nr_zones; i++, p++, z++) {
+			p->start = z->zbz_start;
+			p->wp = z->zbz_write_pointer;
+			p->type = z->zbz_type;
+			p->cond = z->zbz_condition;
+		}
+		if (o->libzbc_debug) {
+			p = f->zbd_info->zone_info;
+			dprint(FD_ZBD, "%s: ----- zone info -----\n", f->file_name);
+			for (i = 0; i < nr_zones; i++, p++) {
+				dprint(FD_ZBD, "S:%lu T:%u C:%u WP:%lu\n",
+				       p->start, p->type, p->cond, p->wp);
+			}
+			dprint(FD_ZBD, "%s: --- end zone info ---\n", f->file_name);
+		}
+
+		free(zones);
+		f->zbd_info->model = info->zbd_model;
+		f->zbd_info->reset_zones = libzbc_reset_zones;
+		td->o.zone_mode = ZONE_MODE_ZBD;
+	}
 
 	return 0;
 }

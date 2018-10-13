@@ -42,16 +42,19 @@ enum io_u_action {
  * @reset_zone: whether or not this zone should be reset before writing to it
  */
 struct fio_zone_info {
-#ifdef CONFIG_LINUX_BLKZONED
 	pthread_mutex_t		mutex;
 	uint64_t		start;
 	uint64_t		wp;
 	uint32_t		verify_block;
+#ifdef CONFIG_LINUX_BLKZONED
 	enum blk_zone_type	type:2;
 	enum blk_zone_cond	cond:4;
+#else
+	uint8_t			type;
+	uint8_t			cond;
+#endif
 	unsigned int		open:1;
 	unsigned int		reset_zone:1;
-#endif
 };
 
 /**
@@ -59,6 +62,7 @@ struct fio_zone_info {
  * @model: Device model.
  * @mutex: Protects the modifiable members in this structure (refcount and
  *		num_open_zones).
+ * @reset_zones: Points to zone reset handler function
  * @zone_size: size of a single zone in units of 512 bytes
  * @sectors_with_data: total size of data in all zones in units of 512 bytes
  * @zone_size_log2: log2 of the zone size in bytes if it is a power of 2 or 0
@@ -78,6 +82,10 @@ struct fio_zone_info {
 struct zoned_block_device_info {
 	enum blk_zoned_model	model;
 	pthread_mutex_t		mutex;
+	int			(*reset_zones)(struct thread_data *td,
+					       struct fio_file *f,
+					       uint64_t offset,
+					       uint64_t length);
 	uint64_t		zone_size;
 	uint64_t		sectors_with_data;
 	uint32_t		zone_size_log2;
@@ -89,7 +97,9 @@ struct zoned_block_device_info {
 	struct fio_zone_info	zone_info[0];
 };
 
-#ifdef CONFIG_LINUX_BLKZONED
+#if defined(CONFIG_LINUX_BLKZONED) || defined(CONFIG_LIBZBC)
+int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
+		       uint32_t nr_zones);
 void zbd_free_zone_info(struct fio_file *f);
 int zbd_init(struct thread_data *td);
 void zbd_file_reset(struct thread_data *td, struct fio_file *f);

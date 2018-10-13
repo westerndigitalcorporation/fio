@@ -264,9 +264,9 @@ static int ilog2(uint64_t i)
  * Initialize f->zbd_info for devices that are not zoned block devices. This
  * allows to execute a ZBD workload against a non-ZBD device.
  */
-static int init_zone_info(struct thread_data *td, struct fio_file *f)
+int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
+		       uint32_t nr_zones)
 {
-	uint32_t nr_zones;
 	struct fio_zone_info *p;
 	uint64_t zone_size;
 	struct zoned_block_device_info *zbd_info = NULL;
@@ -275,7 +275,8 @@ static int init_zone_info(struct thread_data *td, struct fio_file *f)
 
 	zone_size = td->o.zone_size;
 	assert(zone_size);
-	nr_zones = (f->real_file_size + zone_size - 1) / zone_size;
+	if (!nr_zones)
+		nr_zones = (f->real_file_size + zone_size - 1) / zone_size;
 	zbd_info = scalloc(1, sizeof(*zbd_info) +
 			   (nr_zones + 1) * sizeof(zbd_info->zone_info[0]));
 	if (!zbd_info)
@@ -306,6 +307,30 @@ static int init_zone_info(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
+/*
+ * Reset a number of zones based on the input file offset
+ * and length using a block subsystem ioctl.
+ */
+static int block_reset_zones(struct thread_data *td, struct fio_file *f,
+			     uint64_t offset, uint64_t length)
+{
+	struct blk_zone_range zr = {
+		.sector         = offset >> 9,
+		.nr_sectors     = length >> 9,
+	};
+	int ret;
+
+	assert(f->fd != -1);
+	ret = ioctl(f->fd, BLKRESETZONE, &zr);
+	if (ret < 0) {
+		td_verror(td, errno, "resetting wp failed");
+		log_err("%s: resetting wp for %llu sectors at sector %llu failed (%d).\n",
+			f->file_name, zr.nr_sectors, zr.sector, errno);
+		return ret;
+	}
+
+	return 0;
+}
 /*
  * Parse the BLKREPORTZONE output and store it in f->zbd_info. Must be called
  * only for devices that support this ioctl, namely zoned block devices.
@@ -453,11 +478,13 @@ int zbd_create_zone_info(struct thread_data *td, struct fio_file *f)
 		ret = parse_zone_info(td, f);
 		break;
 	case ZBD_DM_NONE:
-		ret = init_zone_info(td, f);
+		ret = zbd_init_zone_info(td, f, 0);
 		break;
 	}
-	if (ret == 0)
+	if (ret == 0) {
 		f->zbd_info->model = zbd_model;
+		f->zbd_info->reset_zones = block_reset_zones;
+	}
 	return ret;
 }
 
@@ -486,7 +513,7 @@ void zbd_free_zone_info(struct fio_file *f)
  * Note: this function can only work correctly if it is called before the first
  * fio fork() call.
  */
-static int zbd_init_zone_info(struct thread_data *td, struct fio_file *file)
+static int init_zone_info(struct thread_data *td, struct fio_file *file)
 {
 	struct thread_data *td2;
 	struct fio_file *f2;
@@ -530,7 +557,8 @@ int zbd_init(struct thread_data *td)
 				f->file_name);
 			return 1;
 		}
-		zbd_init_zone_info(td, f);
+
+		init_zone_info(td, f);
 	}
 
 	if (!zbd_using_direct_io()) {
@@ -567,11 +595,11 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 	struct fio_zone_info *zb, *ze, *z;
 	int ret = 0;
 
-	assert(f->fd != -1);
 	assert(is_valid_offset(f, offset + length - 1));
 	switch (f->zbd_info->model) {
 	case ZBD_DM_HOST_AWARE:
 	case ZBD_DM_HOST_MANAGED:
+		assert(f->fd != -1);
 		ret = ioctl(f->fd, BLKRESETZONE, &zr);
 		if (ret < 0) {
 			td_verror(td, errno, "resetting wp failed");
@@ -646,7 +674,6 @@ static int zbd_reset_zones(struct thread_data *td, struct fio_file *f,
 
 	dprint(FD_ZBD, "%s: examining zones %u .. %u\n", f->file_name,
 		zbd_zone_nr(f->zbd_info, zb), zbd_zone_nr(f->zbd_info, ze));
-	assert(f->fd != -1);
 	for (z = zb; z < ze; z++) {
 		pthread_mutex_lock(&z->mutex);
 		switch (z->type) {

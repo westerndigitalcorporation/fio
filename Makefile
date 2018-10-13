@@ -150,6 +150,9 @@ ifdef CONFIG_LINUX_BLKZONED
 endif
 ifdef CONFIG_LIBZBC
   SOURCE += engines/libzbc.c
+  ifndef CONFIG_LINUX_BLKZONED
+    SOURCE += zbd.c
+  endif
 endif
 
 ifeq ($(CONFIG_TARGET_OS), Linux)
