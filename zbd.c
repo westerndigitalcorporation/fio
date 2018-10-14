@@ -311,7 +311,7 @@ int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
  * Reset a number of zones based on the input file offset
  * and length using a block subsystem ioctl.
  */
-static int block_reset_zones(struct thread_data *td, struct fio_file *f,
+static int block_reset_zones(struct thread_data *td, const struct fio_file *f,
 			     uint64_t offset, uint64_t length)
 {
 	struct blk_zone_range zr = {
@@ -546,6 +546,8 @@ int zbd_init(struct thread_data *td)
 	for_each_file(td, f, i) {
 		if (f->filetype != FIO_TYPE_BLOCK)
 			continue;
+		if (f->zbd_info->zone_info)
+			continue; /* libzbc ioengine might have done this part */
 		if (td->o.zone_size && td->o.zone_size < 512) {
 			log_err("%s: zone size must be at least 512 bytes for --zonemode=zbd\n\n",
 				f->file_name);
@@ -587,10 +589,6 @@ int zbd_init(struct thread_data *td)
 static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 			   uint64_t offset, uint64_t length)
 {
-	struct blk_zone_range zr = {
-		.sector         = offset >> 9,
-		.nr_sectors     = length >> 9,
-	};
 	uint32_t zone_idx_b, zone_idx_e;
 	struct fio_zone_info *zb, *ze, *z;
 	int ret = 0;
@@ -599,14 +597,9 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 	switch (f->zbd_info->model) {
 	case ZBD_DM_HOST_AWARE:
 	case ZBD_DM_HOST_MANAGED:
-		assert(f->fd != -1);
-		ret = ioctl(f->fd, BLKRESETZONE, &zr);
-		if (ret < 0) {
-			td_verror(td, errno, "resetting wp failed");
-			log_err("%s: resetting wp for %llu sectors at sector %llu failed (%d).\n",
-				f->file_name, zr.nr_sectors, zr.sector, errno);
+		ret = f->zbd_info->reset_zones(td, f, offset, length);
+		if (ret)
 			return ret;
-		}
 		break;
 	case ZBD_DM_NONE:
 		break;

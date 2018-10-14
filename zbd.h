@@ -83,7 +83,7 @@ struct zoned_block_device_info {
 	enum blk_zoned_model	model;
 	pthread_mutex_t		mutex;
 	int			(*reset_zones)(struct thread_data *td,
-					       struct fio_file *f,
+					       const struct fio_file *f,
 					       uint64_t offset,
 					       uint64_t length);
 	uint64_t		zone_size;

@@ -89,6 +89,9 @@ static enum fio_q_status fio_libzbc_queue(struct thread_data *td,
 
 	if (ret != count) {
 		if (ret < 0) {
+			td_verror(td, errno, "libzbc i/o failed");
+			log_err("%s: op %u for sector %lu failed (%d)\n",
+				f->file_name, io_u->ddir, offset, errno);
 			io_u->error = -ret;
 		} else {
 			log_err("Short %s, len=%lu, ret=%i\n",
@@ -149,24 +152,25 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f,
 	return 0;
 }
 
-static int libzbc_reset_zones(struct thread_data *td, struct fio_file *f,
+static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 			      uint64_t offset, uint64_t length)
 {
 	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	uint64_t zone_blksz = td->o.zone_size >> 9;
 	int i, ret;
 
 	offset >>= 9;
-	length >>= 9;
+	length = (length + td->o.zone_size - 1) / td->o.zone_size;
 
 	/* FIXME add option to use non-zero zone
 	 * count to reset all zones at once */
-	for (i = 0; i < length; i++, offset += td->o.zone_size) {
+	for (i = 0; i < length; i++, offset += zone_blksz) {
 		ret = zbc_reset_zone(ld->zdev, offset, 0);
 		if (ret) {
 			td_verror(td, errno, "resetting wp failed");
-			log_err("%s: resetting wp for sector %lu failed (%d).\n",
+			log_err("%s: resetting wp for sector %lu failed (%d)\n",
 				f->file_name, offset, errno);
-			return ret;
+			return -ret;
 		}
 	}
 
@@ -239,8 +243,8 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 
 		p = f->zbd_info->zone_info;
 		for (i = 0, z = zones; i < nr_zones; i++, p++, z++) {
-			p->start = z->zbz_start;
-			p->wp = z->zbz_write_pointer;
+			p->start = z->zbz_start << 9;
+			p->wp = z->zbz_write_pointer << 9;
 			p->type = z->zbz_type;
 			p->cond = z->zbz_condition;
 		}
@@ -255,11 +259,18 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 		}
 
 		free(zones);
+
+		f->filetype = FIO_TYPE_BLOCK;
 		f->zbd_info->model = info->zbd_model;
 		f->zbd_info->reset_zones = libzbc_reset_zones;
 		td->o.zone_mode = ZONE_MODE_ZBD;
 	}
 
+	return 0;
+}
+
+static int fio_libzbc_invalidate(struct thread_data *td, struct fio_file *f)
+{
 	return 0;
 }
 
@@ -271,6 +282,7 @@ static struct ioengine_ops ioengine = {
 	.open_file		= fio_libzbc_open_file,
 	.close_file		= fio_libzbc_close_file,
 	.get_file_size		= fio_libzbc_get_file_size,
+	.invalidate		= fio_libzbc_invalidate,
 	.flags			= FIO_SYNCIO | FIO_NOEXTEND,
 	.options		= options,
 	.option_struct_size	= sizeof(struct libzbc_options),
