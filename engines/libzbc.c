@@ -162,7 +162,7 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 	offset >>= 9;
 	length = (length + td->o.zone_size - 1) / td->o.zone_size;
 
-	/* FIXME add option to use non-zero zone
+	/* TODO add option to use non-zero zone
 	 * count to reset all zones at once */
 	for (i = 0; i < length; i++, offset += zone_blksz) {
 		ret = zbc_reset_zone(ld->zdev, offset, 0);
@@ -176,6 +176,34 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 
 	return 0;
 }
+
+
+static bool libzbc_can_proc_zone(enum fio_ddir ddir, struct fio_zone_info *z)
+{
+	return (z->cond != (uint8_t)ZBC_ZC_OFFLINE) &&
+	        !(ddir == DDIR_READ && z->cond == (uint8_t)ZBC_ZC_RDONLY);
+}
+
+static bool libzbc_can_proc_zone_zd(enum fio_ddir ddir,
+				    struct fio_zone_info *z)
+{
+	if (z->type == (uint8_t)ZBC_ZT_GAP)
+		return false;
+	if (z->type == (uint8_t)ZBC_ZT_SEQ_OR_BEF_REQ)
+		return false; /* FIXME bypassed for debug, need to support */
+
+	switch ((uint8_t)z->cond) {
+	case ZBC_ZC_OFFLINE:
+	case ZBC_ZC_INACTIVE:
+		return false;
+	case ZBC_ZC_RDONLY:
+	        return ddir == DDIR_READ;
+	}
+
+	return true;
+}
+
+
 
 static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
 {
@@ -206,6 +234,7 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	struct fio_zone_info *p;
 	unsigned int nr_zones;
 	int i, ret;
+	bool zoned;
 
 	ret = libzbc_setup(td, f, &ld);
 	if (ret)
@@ -221,9 +250,11 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	dprint(FD_ZBD, "file_size(%s)=%luB\n",
 	       f->file_name, f->real_file_size);
 
-	if (info->zbd_model == ZBC_DM_HOST_MANAGED ||
-	    info->zbd_model == ZBC_DM_HOST_AWARE) {
+	zoned = info->zbd_model == ZBC_DM_HOST_MANAGED ||
+		info->zbd_model == ZBC_DM_HOST_AWARE ||
+		(info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT);
 
+	if (zoned) {
 		ret = zbc_list_zones(ld->zdev, 0LL, ZBC_RZ_RO_ALL,
 				     &zones, &nr_zones);
 		if (ret || !zones) {
@@ -248,6 +279,9 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 			p->type = z->zbz_type;
 			p->cond = z->zbz_condition;
 		}
+
+		free(zones);
+
 		if (o->libzbc_debug) {
 			p = f->zbd_info->zone_info;
 			dprint(FD_ZBD, "%s: ----- zone info -----\n", f->file_name);
@@ -256,13 +290,23 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 				       p->start, p->type, p->cond, p->wp);
 			}
 			dprint(FD_ZBD, "%s: --- end zone info ---\n", f->file_name);
+
 		}
 
-		free(zones);
+		if (!(info->zbd_flags & ZBC_UNRESTRICTED_READ)) {
+			if (td->o.read_beyond_wp) {
+				dprint(FD_ZBD, "%s doesn't support reading beyond WP\n",
+				       f->file_name);
+				td->o.read_beyond_wp = false;
+			}
+		}
 
 		f->filetype = FIO_TYPE_BLOCK;
 		f->zbd_info->model = info->zbd_model;
 		f->zbd_info->reset_zones = libzbc_reset_zones;
+		f->zbd_info->can_process_zone =
+			(info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT) ?
+			 libzbc_can_proc_zone_zd : libzbc_can_proc_zone;
 		td->o.zone_mode = ZONE_MODE_ZBD;
 	}
 
