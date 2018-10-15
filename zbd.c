@@ -331,6 +331,18 @@ static int block_reset_zones(struct thread_data *td, const struct fio_file *f,
 
 	return 0;
 }
+
+/*
+ * Determine if the given zone should be skipped based on
+ * its' type and condition. The libzbc ioengine may override
+ * this function to handle a wider set of criteria for skipping
+ * zones.
+ */
+static bool zbd_can_process_zone(enum fio_ddir ddir, struct fio_zone_info *z)
+{
+	return (z->cond != BLK_ZONE_COND_OFFLINE);
+}
+
 /*
  * Parse the BLKREPORTZONE output and store it in f->zbd_info. Must be called
  * only for devices that support this ioctl, namely zoned block devices.
@@ -484,6 +496,7 @@ int zbd_create_zone_info(struct thread_data *td, struct fio_file *f)
 	if (ret == 0) {
 		f->zbd_info->model = zbd_model;
 		f->zbd_info->reset_zones = block_reset_zones;
+		f->zbd_info->can_process_zone = zbd_can_process_zone;
 	}
 	return ret;
 }
@@ -858,7 +871,7 @@ static bool zbd_open_zone(struct thread_data *td, const struct io_u *io_u,
 	struct fio_zone_info *z = &f->zbd_info->zone_info[zone_idx];
 	bool res = true;
 
-	if (z->cond == BLK_ZONE_COND_OFFLINE)
+	if (!f->zbd_info->can_process_zone(DDIR_WRITE, z))
 		return false;
 
 	/*
@@ -1074,7 +1087,8 @@ zbd_find_zone(struct thread_data *td, struct io_u *io_u,
 	 * the nearest non-empty zone in case of random I/O.
 	 */
 	for (z1 = zb + 1, z2 = zb - 1; z1 < zl || z2 >= zf; z1++, z2--) {
-		if (z1 < zl && z1->cond != BLK_ZONE_COND_OFFLINE) {
+		if (z1 < zl &&
+		    f->zbd_info->can_process_zone(io_u->ddir, z1)) {
 			pthread_mutex_lock(&z1->mutex);
 			if (z1->start + min_bs <= z1->wp)
 				return z1;
@@ -1083,7 +1097,7 @@ zbd_find_zone(struct thread_data *td, struct io_u *io_u,
 			break;
 		}
 		if (td_random(td) && z2 >= zf &&
-		    z2->cond != BLK_ZONE_COND_OFFLINE) {
+		    f->zbd_info->can_process_zone(io_u->ddir, z2)) {
 			pthread_mutex_lock(&z2->mutex);
 			if (z2->start + min_bs <= z2->wp)
 				return z2;
@@ -1194,7 +1208,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 	 * Accept the I/O offset for reads if reading beyond the write pointer
 	 * is enabled.
 	 */
-	if (zb->cond != BLK_ZONE_COND_OFFLINE &&
+	if (f->zbd_info->can_process_zone(io_u->ddir, zb) &&
 	    io_u->ddir == DDIR_READ && td->o.read_beyond_wp)
 		return io_u_accept;
 
@@ -1212,7 +1226,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		 * I/O of at least min_bs B. If there isn't, find a new zone for
 		 * the I/O.
 		 */
-		range = zb->cond != BLK_ZONE_COND_OFFLINE ?
+		range = f->zbd_info->can_process_zone(io_u->ddir, zb) ?
 			zb->wp - zb->start : 0;
 		if (range < min_bs ||
 		    ((!td_random(td)) && (io_u->offset + min_bs > zb->wp))) {
@@ -1337,7 +1351,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 
 accept:
 	assert(zb);
-	assert(zb->cond != BLK_ZONE_COND_OFFLINE);
+	assert(f->zbd_info->can_process_zone(io_u->ddir, zb));
 	assert(!io_u->post_submit);
 	io_u->post_submit = zbd_post_submit;
 	return io_u_accept;

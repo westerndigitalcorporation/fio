@@ -86,6 +86,8 @@ struct zoned_block_device_info {
 					       const struct fio_file *f,
 					       uint64_t offset,
 					       uint64_t length);
+	bool			(*can_process_zone)(enum fio_ddir dir,
+						    struct fio_zone_info *z);
 	uint64_t		zone_size;
 	uint64_t		sectors_with_data;
 	uint32_t		zone_size_log2;
