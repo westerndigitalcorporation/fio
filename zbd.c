@@ -591,19 +591,17 @@ int zbd_init(struct thread_data *td)
 }
 
 /**
- * zbd_reset_range - reset zones for a range of sectors
+ * zbd_do_zone_reset - perform hardware zone reset on a range of sectors
  * @td: FIO thread data.
  * @f: Fio file for which to reset zones
- * @sector: Starting sector in units of 512 bytes
- * @nr_sectors: Number of sectors in units of 512 bytes
+ * @offset: Starting sector in byte units
+ * @length: Number of sectors in byte units
  *
  * Returns 0 upon success and a negative error code upon failure.
  */
-static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
-			   uint64_t offset, uint64_t length)
+static int zbd_do_zone_reset(struct thread_data *td, const struct fio_file *f,
+			     uint64_t offset, uint64_t length)
 {
-	uint32_t zone_idx_b, zone_idx_e;
-	struct fio_zone_info *zb, *ze, *z;
 	int ret = 0;
 
 	assert(is_valid_offset(f, offset + length - 1));
@@ -618,10 +616,30 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 		break;
 	}
 
-	zone_idx_b = zbd_zone_idx(f, offset);
-	zb = &f->zbd_info->zone_info[zone_idx_b];
-	zone_idx_e = zbd_zone_idx(f, offset + length);
-	ze = &f->zbd_info->zone_info[zone_idx_e];
+	return ret;
+}
+
+/**
+ * zbd_reset_cont_range - reset zones for a contiguous range of zones
+ * @td: FIO thread data.
+ * @f: Fio file for which to reset zones
+ * @zb: first zone to reset.
+ * @ze: first zone not to reset.
+ * @pidx: The thread I/O data index for the priority used for reset command.
+ *
+ * Returns 0 upon success and a negative error code upon failure.
+ */
+static int zbd_reset_cont_range(struct thread_data *td,
+			const struct fio_file *f, struct fio_zone_info *zb,
+			struct fio_zone_info *ze, int pidx)
+{
+	struct fio_zone_info *z;
+	int ret;
+
+	ret = zbd_do_zone_reset(td, f, zb->start, ze->start - zb->start);
+	if (ret)
+		return ret;
+
 	for (z = zb; z < ze; z++) {
 		pthread_mutex_lock(&z->mutex);
 		pthread_mutex_lock(&f->zbd_info->mutex);
@@ -636,6 +654,52 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 
 	return ret;
 }
+
+/**
+ * zbd_reset_range - reset zones for a range of sectors
+ * @td: FIO thread data.
+ * @f: Fio file for which to reset zones
+ * @offset: Starting offset of the range in byte units
+ * @length: Byte length of the range
+ * @pidx: The thread I/O data index for the priority used for reset command.
+ *
+ * Reset range may contain zones that can't be reset or even accessed.
+ * If necessary, break down the input range of zones to skip all such zones
+ * and call \a zbd_reset_cont_range() for each resulting subrange.
+ *
+ * Returns 0 upon success and a negative error code upon failure.
+ */
+static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
+			   uint64_t offset, uint64_t length, int pidx)
+{
+	uint32_t zone_idx_b, zone_idx_e;
+	struct fio_zone_info *zb, *ze, *z;
+	int ret = 0;
+
+	zone_idx_b = zbd_zone_idx(f, offset);
+	zb = &f->zbd_info->zone_info[zone_idx_b];
+	zone_idx_e = zbd_zone_idx(f, offset + length);
+	ze = &f->zbd_info->zone_info[zone_idx_e];
+	for (z = zb; z < ze; z++) {
+		if (!f->zbd_info->can_process_zone(DDIR_WRITE, z)) {
+			if (zb < z) {
+				ret = zbd_reset_cont_range(td, f, zb, z,
+							   pidx);
+				if (ret)
+					return ret;
+			}
+			zb = z + 1;
+		}
+	}
+	if (zb < ze) {
+		ret = zbd_reset_cont_range(td, f, zb, ze, pidx);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
 
 static unsigned int zbd_zone_nr(struct zoned_block_device_info *zbd_info,
 				struct fio_zone_info *zone)
