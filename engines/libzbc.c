@@ -234,7 +234,7 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	struct fio_zone_info *p;
 	unsigned int nr_zones;
 	int i, ret;
-	bool zoned;
+	bool zoned, zd;
 
 	ret = libzbc_setup(td, f, &ld);
 	if (ret)
@@ -246,13 +246,10 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	       zbc_device_model_str(info->zbd_model));
 
 	f->real_file_size = info->zbd_sectors * 512;
-	fio_file_set_size_known(f);
-	dprint(FD_ZBD, "file_size(%s)=%luB\n",
-	       f->file_name, f->real_file_size);
 
+	zd = (info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT);
 	zoned = info->zbd_model == ZBC_DM_HOST_MANAGED ||
-		info->zbd_model == ZBC_DM_HOST_AWARE ||
-		(info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT);
+		info->zbd_model == ZBC_DM_HOST_AWARE || zd;
 
 	if (zoned) {
 		ret = zbc_list_zones(ld->zdev, 0LL, ZBC_RZ_RO_ALL,
@@ -263,11 +260,24 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 			return ret;
 		}
 		td->o.zone_size = zones->zbz_length << 9;
+
+		if (zd) {
+			/* Trim all inactive/gap zones at the top of the
+			 * zone range. Modify the file size accordingly */
+			for (z = zones + nr_zones - 1; z >= zones; z--) {
+				if (zbc_zone_inactive(z) || zbc_zone_gap(z))
+					nr_zones--;
+			}
+			f->real_file_size = nr_zones * td->o.zone_size;
+		}
 		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB\n",
 		       f->file_name, nr_zones, td->o.zone_size);
 
 		ret = zbd_init_zone_info(td, f, nr_zones);
 		if (ret) {
+			td_verror(td, errno, "init zone info failed");
+			log_err("%s: zone info initialization zailed (%d)\n",
+				f->file_name, ret);
 			free(zones);
 			return ret;
 		}
@@ -304,11 +314,14 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 		f->filetype = FIO_TYPE_BLOCK;
 		f->zbd_info->model = info->zbd_model;
 		f->zbd_info->reset_zones = libzbc_reset_zones;
-		f->zbd_info->can_process_zone =
-			(info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT) ?
-			 libzbc_can_proc_zone_zd : libzbc_can_proc_zone;
+		f->zbd_info->can_process_zone = zd ? libzbc_can_proc_zone_zd :
+						     libzbc_can_proc_zone;
 		td->o.zone_mode = ZONE_MODE_ZBD;
 	}
+
+	fio_file_set_size_known(f);
+	dprint(FD_ZBD, "file_size(%s)=%luB\n",
+	       f->file_name, f->real_file_size);
 
 	return 0;
 }
