@@ -1264,17 +1264,16 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 	zb = &f->zbd_info->zone_info[zone_idx_b];
 	orig_zb = zb;
 
-	/* Accept the I/O offset for conventional zones. */
-	if (zb->type == BLK_ZONE_TYPE_CONVENTIONAL)
-		return io_u_accept;
-
 	/*
-	 * Accept the I/O offset for reads if reading beyond the write pointer
-	 * is enabled.
+	 * For online zones, accept the I/O offset for reads if reading
+	 * beyond the write pointer is enabled. Accept the I/O offset
+	 * for conventional zones.
 	 */
-	if (f->zbd_info->can_process_zone(io_u->ddir, zb) &&
-	    io_u->ddir == DDIR_READ && td->o.read_beyond_wp)
-		return io_u_accept;
+	if (f->zbd_info->can_process_zone(io_u->ddir, zb)) {
+	    if (zb->type == BLK_ZONE_TYPE_CONVENTIONAL ||
+	        (io_u->ddir == DDIR_READ && td->o.read_beyond_wp))
+			return io_u_accept;
+	}
 
 	zbd_check_swd(f);
 
@@ -1340,6 +1339,20 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		assert(io_u->offset + io_u->buflen <= zb->wp);
 		goto accept;
 	case DDIR_WRITE:
+		if (!f->zbd_info->can_process_zone(DDIR_WRITE, zb)) {
+			pthread_mutex_unlock(&zb->mutex);
+			zl = &f->zbd_info->zone_info[zbd_zone_idx(f,
+						f->file_offset + f->io_size)];
+			zb = zbd_find_zone(td, io_u, zb, zl);
+			if (!zb) {
+				dprint(FD_ZBD,
+				       "%s: zbd_find_zone(%lld, %llu) failed\n",
+				       f->file_name, io_u->offset,
+				       io_u->buflen);
+				goto eof;
+			}
+			zone_idx_b = zbd_zone_nr(f->zbd_info, zb);
+		}
 		if (io_u->buflen > f->zbd_info->zone_size)
 			goto eof;
 		if (!zbd_open_zone(td, io_u, zone_idx_b)) {
@@ -1374,7 +1387,10 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		}
 		/* Make writes occur at the write pointer */
 		assert(!zbd_zone_full(f, zb, min_bs));
-		io_u->offset = zb->wp;
+		if (zb->type == BLK_ZONE_TYPE_CONVENTIONAL)
+			io_u->offset = zb->start;
+		else
+			io_u->offset = zb->wp;
 		if (!is_valid_offset(f, io_u->offset)) {
 			dprint(FD_ZBD, "Dropped request with offset %llu\n",
 			       io_u->offset);

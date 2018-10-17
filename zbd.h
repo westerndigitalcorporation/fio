@@ -46,7 +46,7 @@ struct fio_zone_info {
 	uint64_t		start;
 	uint64_t		wp;
 	uint32_t		verify_block;
-#ifdef CONFIG_LINUX_BLKZONED
+#if defined(CONFIG_LINUX_BLKZONED) && !defined(CONFIG_LIBZBC)
 	enum blk_zone_type	type:2;
 	enum blk_zone_cond	cond:4;
 #else
