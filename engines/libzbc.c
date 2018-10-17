@@ -21,12 +21,14 @@
 struct libzbc_data {
 	struct zbc_device *zdev;
 	struct zbc_device_info info;
+	uint64_t first_active; /* LBA of the first active zone */
 };
 
 struct libzbc_options {
 	void *pad;
 	unsigned int force_ata;
 	unsigned int libzbc_debug;
+	unsigned int skip_all;
 };
 
 static struct fio_option options[] = {
@@ -51,6 +53,16 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_LIBZBC,
 	},
 	{
+		.name	= "skip_all",
+		.lname	= "skip all inactive zones",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct libzbc_options, skip_all),
+		.help	= "for ZD, skip inactive zones at the bottom",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBZBC,
+	},
+	{
 		.name	= NULL,
 	},
 };
@@ -66,7 +78,7 @@ static enum fio_q_status fio_libzbc_queue(struct thread_data *td,
 
 	fio_ro_check(td, io_u);
 
-	offset = io_u->offset >> 9;
+	offset = (io_u->offset >> 9) + ld->first_active;
 	count = io_u->xfer_buflen >> 9;
 	if (io_u->ddir == DDIR_READ) {
 		ret = zbc_pread(ld->zdev, io_u->xfer_buf, count, offset);
@@ -120,6 +132,7 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 	int i, ret;
 
 	offset >>= 9;
+	offset += ld->first_active;
 	length = (length + td->o.zone_size - 1) / td->o.zone_size;
 
 	/* TODO add option to use non-zero zone
@@ -164,12 +177,7 @@ static bool libzbc_can_proc_zone_zd(enum fio_ddir ddir,
 
 static void libzbc_print_zone(unsigned int num, struct fio_zone_info *p)
 {
-	if (p->type == (uint8_t)ZBC_ZT_CONVENTIONAL ||
-	    p->type == (uint8_t)ZBC_ZT_GAP ||
-	    p->cond == (uint8_t)ZBC_ZC_NOT_WP ||
-	    p->cond == (uint8_t)ZBC_ZC_INACTIVE ||
-	    p->cond == (uint8_t)ZBC_ZC_RDONLY ||
-	    p->cond == (uint8_t)ZBC_ZC_OFFLINE) {
+	if (p->wp == (uint64_t)-1) {
 		dprint(FD_ZBD,
 			"%05u S:%012lu/%010lu T:%u(%s) C:%u(%s)\n",
 			num, p->start, p->start >> 9, p->type,
@@ -192,7 +200,7 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	struct zbc_device_info *info;
 	struct zbc_zone *zones = NULL, *z;
 	struct fio_zone_info *p;
-	unsigned int nr_zones;
+	unsigned int start = 0, nr_zones;
 	int i, ret, flags;
 	bool zoned, zd;
 
@@ -243,35 +251,59 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 		td->o.zone_size = zones->zbz_length << 9;
 
 		if (zd) {
-			/* Trim all inactive/gap zones at the top of the
-			 * zone range. Modify the file size accordingly */
-			for (z = zones + nr_zones - 1; z >= zones; z--) {
-				if (zbc_zone_inactive(z) || zbc_zone_gap(z))
-					nr_zones--;
-				else
+			if (o->skip_all) {
+				/*
+				* Find the first zone that is not inactive
+				* or gap. We will skip all the zones before it
+				*/
+				for (z = zones;
+				     start < nr_zones;
+				     z++, start++) {
+					if (!zbc_zone_inactive(z) &&
+					    !zbc_zone_gap(z))
+						break;
+				}
+			}
+
+			/*
+			 * Trim all inactive/gap zones at the top of the
+			 * zone range. Modify the file size accordingly
+			 */
+			for (z = zones + nr_zones - 1;
+			     nr_zones > start;
+			     z--, nr_zones--) {
+				if (!zbc_zone_inactive(z) && !zbc_zone_gap(z))
 					break;
 			}
-			f->real_file_size = nr_zones * td->o.zone_size;
+			f->real_file_size = (nr_zones - start) * td->o.zone_size;
+			ld->first_active = start * zones->zbz_length;
 		}
-		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB\n",
-		       f->file_name, nr_zones, td->o.zone_size);
+		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB, first_active=%lu\n",
+		       f->file_name, nr_zones, td->o.zone_size, ld->first_active);
 
-		ret = zbd_init_zone_info(td, f, nr_zones);
+		ret = zbd_init_zone_info(td, f, nr_zones - start);
 		if (ret) {
 			td_verror(td, errno, "init zone info failed");
-			log_err("%s: zone info initialization zailed (%d)\n",
+			log_err("%s: zone info initialization failed (%d)\n",
 				f->file_name, ret);
 			free(zones);
 			return ret;
 		}
 
 		p = f->zbd_info->zone_info;
-		for (i = 0, z = zones; i < nr_zones; i++, p++, z++) {
-			p->start = z->zbz_start << 9;
-			p->wp = z->zbz_write_pointer << 9;
+		for (i = start, z = zones + start;
+		     i < nr_zones;
+		     i++, p++, z++) {
+			p->start = (z->zbz_start - ld->first_active) << 9;
+			if (z->zbz_write_pointer != (uint64_t)-1)
+				p->wp = (z->zbz_write_pointer -
+					 ld->first_active) << 9;
+			else
+				p->wp = z->zbz_write_pointer;
 			p->type = z->zbz_type;
 			p->cond = z->zbz_condition;
 		}
+		nr_zones -= start;
 
 		free(zones);
 
