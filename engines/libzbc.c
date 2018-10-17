@@ -112,46 +112,6 @@ static void fio_libzbc_cleanup(struct thread_data *td)
 		free(ld);
 }
 
-static int libzbc_setup(struct thread_data *td, struct fio_file *f,
-			struct libzbc_data **pld)
-{
-	struct libzbc_data *ld = td->io_ops_data;
-	struct libzbc_options *o = td->eo;
-	int rc, flags;
-
-	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
-	ld = FILE_SET_ENG_DATA(f, ld);
-	if (!ld) {
-		ld = calloc(1, sizeof(*ld));
-		if (!ld)
-			return -ENOMEM;
-
-		if (o->libzbc_debug)
-			zbc_set_log_level("debug");
-
-		dprint(FD_ZBD, "libzbc_debug=%i\n", o->libzbc_debug);
-		dprint(FD_ZBD, "force_ata=%i\n", o->force_ata);
-
-		if (!o->force_ata)
-			flags = ZBC_O_DRV_BLOCK | ZBC_O_DRV_SCSI | ZBC_O_DRV_ATA;
-		else
-			flags = ZBC_O_DRV_ATA;
-		rc = zbc_open(f->file_name, flags, &ld->zdev);
-		if (rc)
-			return rc;
-
-		zbc_get_device_info(ld->zdev, &ld->info);
-		dprint(FD_ZBD, "zbd_vendor_id:%s\n", ld->info.zbd_vendor_id);
-
-		FILE_SET_ENG_DATA(f, ld);
-	}
-
-	if (pld)
-		*pld = ld;
-
-	return 0;
-}
-
 static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 			      uint64_t offset, uint64_t length)
 {
@@ -176,7 +136,6 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 
 	return 0;
 }
-
 
 static bool libzbc_can_proc_zone(enum fio_ddir ddir, struct fio_zone_info *z)
 {
@@ -203,46 +162,69 @@ static bool libzbc_can_proc_zone_zd(enum fio_ddir ddir,
 	return true;
 }
 
-
-
-static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
+static void libzbc_print_zone(unsigned int num, struct fio_zone_info *p)
 {
-	return libzbc_setup(td, f, NULL);
+	if (p->type == (uint8_t)ZBC_ZT_CONVENTIONAL ||
+	    p->type == (uint8_t)ZBC_ZT_GAP ||
+	    p->cond == (uint8_t)ZBC_ZC_NOT_WP ||
+	    p->cond == (uint8_t)ZBC_ZC_INACTIVE ||
+	    p->cond == (uint8_t)ZBC_ZC_RDONLY ||
+	    p->cond == (uint8_t)ZBC_ZC_OFFLINE) {
+		dprint(FD_ZBD,
+			"%05u S:%012lu/%010lu T:%u(%s) C:%u(%s)\n",
+			num, p->start, p->start >> 9, p->type,
+			zbc_zone_type_str(p->type), p->cond,
+			zbc_zone_condition_str(p->cond));
+	} else {
+		dprint(FD_ZBD,
+			"%05u S:%012lu/%010lu T:%u(%s) C:%u(%s) WP:%lu/%lu\n",
+			num, p->start, p->start >> 9, p->type,
+			zbc_zone_type_str(p->type), p->cond,
+			zbc_zone_condition_str(p->cond),
+			p->wp, p->wp >> 9);
+	}
 }
 
-static int fio_libzbc_close_file(struct thread_data fio_unused *td,
-				 struct fio_file *f)
+static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 {
-	struct libzbc_data *ld = FILE_ENG_DATA(f);
-
-	if (!ld)
-		return 0;
-	if (ld->zdev)
-		zbc_close(ld->zdev);
-	free(ld);
-
-	FILE_SET_ENG_DATA(f, NULL);
-	return 0;
-}
-
-static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
-{
-	struct libzbc_data *ld;
+	struct libzbc_data *ld = td->io_ops_data;
 	struct libzbc_options *o = td->eo;
 	struct zbc_device_info *info;
 	struct zbc_zone *zones = NULL, *z;
 	struct fio_zone_info *p;
 	unsigned int nr_zones;
-	int i, ret;
+	int i, ret, flags;
 	bool zoned, zd;
 
-	ret = libzbc_setup(td, f, &ld);
+	ld = FILE_SET_ENG_DATA(f, ld);
+	if (ld)
+		return 0;
+
+	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
+	ld = calloc(1, sizeof(*ld));
+	if (!ld)
+		return -ENOMEM;
+
+	if (o->libzbc_debug)
+		zbc_set_log_level("debug");
+
+	dprint(FD_ZBD, "libzbc_debug=%i\n", o->libzbc_debug);
+	dprint(FD_ZBD, "force_ata=%i\n", o->force_ata);
+
+	if (!o->force_ata)
+		flags = ZBC_O_DRV_BLOCK | ZBC_O_DRV_SCSI | ZBC_O_DRV_ATA;
+	else
+		flags = ZBC_O_DRV_ATA;
+	ret = zbc_open(f->file_name, flags, &ld->zdev);
 	if (ret)
 		return ret;
 
+	zbc_get_device_info(ld->zdev, &ld->info);
 	info = &ld->info;
-	dprint(FD_ZBD, "(%s)zbd_type: %s, zbd_model: %s\n",
-	       f->file_name, zbc_device_type_str(info->zbd_type),
+
+	dprint(FD_ZBD, "(%s)vendor_id:%s, type: %s, model: %s\n",
+	       f->file_name, ld->info.zbd_vendor_id,
+	       zbc_device_type_str(info->zbd_type),
 	       zbc_device_model_str(info->zbd_model));
 
 	f->real_file_size = info->zbd_sectors * 512;
@@ -250,7 +232,6 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	zd = (info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT);
 	zoned = info->zbd_model == ZBC_DM_HOST_MANAGED ||
 		info->zbd_model == ZBC_DM_HOST_AWARE || zd;
-
 	if (zoned) {
 		ret = zbc_list_zones(ld->zdev, 0LL, ZBC_RZ_RO_ALL,
 				     &zones, &nr_zones);
@@ -267,6 +248,8 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 			for (z = zones + nr_zones - 1; z >= zones; z--) {
 				if (zbc_zone_inactive(z) || zbc_zone_gap(z))
 					nr_zones--;
+				else
+					break;
 			}
 			f->real_file_size = nr_zones * td->o.zone_size;
 		}
@@ -294,18 +277,19 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 
 		if (o->libzbc_debug) {
 			p = f->zbd_info->zone_info;
-			dprint(FD_ZBD, "%s: ----- zone info -----\n", f->file_name);
-			for (i = 0; i < nr_zones; i++, p++) {
-				dprint(FD_ZBD, "S:%lu T:%u C:%u WP:%lu\n",
-				       p->start, p->type, p->cond, p->wp);
-			}
-			dprint(FD_ZBD, "%s: --- end zone info ---\n", f->file_name);
+			dprint(FD_ZBD, "%s: ----- zone info -----\n",
+			       f->file_name);
+			for (i = 0; i < nr_zones; i++, p++)
+				libzbc_print_zone(i, p);
+			dprint(FD_ZBD, "%s: --- end zone info ---\n",
+			       f->file_name);
 
 		}
 
 		if (!(info->zbd_flags & ZBC_UNRESTRICTED_READ)) {
 			if (td->o.read_beyond_wp) {
-				dprint(FD_ZBD, "%s doesn't support reading beyond WP\n",
+				dprint(FD_ZBD,
+				       "%s doesn't support reads beyond WP\n",
 				       f->file_name);
 				td->o.read_beyond_wp = false;
 			}
@@ -323,7 +307,35 @@ static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
 	dprint(FD_ZBD, "file_size(%s)=%luB\n",
 	       f->file_name, f->real_file_size);
 
+	FILE_SET_ENG_DATA(f, ld);
+
 	return 0;
+}
+
+static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
+{
+	return 0;
+}
+
+static int fio_libzbc_close_file(struct thread_data fio_unused *td,
+				 struct fio_file *f)
+{
+	struct libzbc_data *ld = FILE_ENG_DATA(f);
+
+	if (!ld)
+		return 0;
+	if (ld->zdev)
+		zbc_close(ld->zdev);
+
+	FILE_SET_ENG_DATA(f, NULL);
+	free(ld);
+
+	return 0;
+}
+
+static int fio_libzbc_get_file_size(struct thread_data *td, struct fio_file *f)
+{
+	return libzbc_setup(td, f);
 }
 
 static int fio_libzbc_invalidate(struct thread_data *td, struct fio_file *f)
