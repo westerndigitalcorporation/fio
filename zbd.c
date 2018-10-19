@@ -39,6 +39,12 @@ static uint32_t zbd_zone_idx(const struct fio_file *f, uint64_t offset)
 	return min(zone_idx, f->zbd_info->nr_zones);
 }
 
+static unsigned int zbd_zone_nr(struct zoned_block_device_info *zbd_info,
+				struct fio_zone_info *zone)
+{
+	return zone - (struct fio_zone_info *)zbd_info->zone_info;
+}
+
 /**
  * zbd_zone_full - verify whether a minimum number of bytes remain in a zone
  * @f: file pointer.
@@ -52,7 +58,7 @@ static bool zbd_zone_full(const struct fio_file *f, struct fio_zone_info *z,
 {
 	assert((required & 511) == 0);
 
-	return z->type == BLK_ZONE_TYPE_SEQWRITE_REQ &&
+	return zbd_wp_zone(f, z) &&
 		z->wp + required > z->start + f->zbd_info->zone_size;
 }
 
@@ -92,8 +98,7 @@ static bool zbd_is_seq_job(struct fio_file *f)
 	zone_idx_b = zbd_zone_idx(f, f->file_offset);
 	zone_idx_e = zbd_zone_idx(f, f->file_offset + f->io_size - 1);
 	for (zone_idx = zone_idx_b; zone_idx <= zone_idx_e; zone_idx++)
-		if (f->zbd_info->zone_info[zone_idx].type ==
-		    BLK_ZONE_TYPE_SEQWRITE_REQ)
+		if (zbd_wp_zone(f, &f->zbd_info->zone_info[zone_idx]))
 			return true;
 
 	return false;
@@ -338,9 +343,40 @@ static int block_reset_zones(struct thread_data *td, const struct fio_file *f,
  * this function to handle a wider set of criteria for skipping
  * zones.
  */
-static bool zbd_can_process_zone(enum fio_ddir ddir, struct fio_zone_info *z)
+static enum zbd_zone_pr zbd_io_allowed(struct thread_data *td,
+				       const struct fio_file *f,
+				       enum fio_ddir ddir,
+				       struct fio_zone_info *z)
 {
-	return (z->cond != BLK_ZONE_COND_OFFLINE);
+	if (z->type == BLK_ZONE_TYPE_CONVENTIONAL)
+	    return ZBD_IO_ANY;
+
+	if (z->cond == BLK_ZONE_COND_OFFLINE)
+		return ZBD_IO_NONE;
+
+	if (z->type == BLK_ZONE_TYPE_SEQWRITE_REQ) {
+		if (ddir == DDIR_READ && td->o.read_beyond_wp)
+			return ZBD_IO_ANY;
+		else
+			return ZBD_IO_AT_WP;
+	}
+	if (z->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
+		return (ddir == DDIR_READ) ? ZBD_IO_ANY : ZBD_IO_BELOW_WP;
+
+	return ZBD_IO_NONE; /* Unsupported zone type/condition */
+}
+
+/*
+ * Return true if the given zone is a write pointer zone. The libzbc ioengine
+ * may override this function to handle a wider set of zone types/conditions.
+ */
+static bool zbd_is_wp_zone(struct fio_zone_info *z)
+{
+	if (z->type == BLK_ZONE_TYPE_SEQWRITE_REQ ||
+	    z->type == BLK_ZONE_TYPE_SEQWRITE_PREF)
+		return true;
+
+	return false;
 }
 
 /*
@@ -496,7 +532,8 @@ int zbd_create_zone_info(struct thread_data *td, struct fio_file *f)
 	if (ret == 0) {
 		f->zbd_info->model = zbd_model;
 		f->zbd_info->reset_zones = block_reset_zones;
-		f->zbd_info->can_process_zone = zbd_can_process_zone;
+		f->zbd_info->zone_io_allowed = zbd_io_allowed;
+		f->zbd_info->wp_zone = zbd_is_wp_zone;
 	}
 	return ret;
 }
@@ -608,7 +645,7 @@ static int zbd_do_zone_reset(struct thread_data *td, const struct fio_file *f,
 	switch (f->zbd_info->model) {
 	case ZBD_DM_HOST_AWARE:
 	case ZBD_DM_HOST_MANAGED:
-		ret = f->zbd_info->reset_zones(td, f, offset, length);
+		ret = zbd_zone_reset(td, f, offset, length);
 		if (ret)
 			return ret;
 		break;
@@ -637,10 +674,19 @@ static int zbd_reset_cont_range(struct thread_data *td,
 	int ret;
 
 	ret = zbd_do_zone_reset(td, f, zb->start, ze->start - zb->start);
-	if (ret)
+	if (ret) {
+		log_err("Reset of range %u .. %u failed",
+			zbd_zone_nr(f->zbd_info, zb),
+			zbd_zone_nr(f->zbd_info, ze));
+		for (z = zb; z < ze; z++) {
+			log_err("Start:%lu/%lu,WP=%lu/%lu\n",
+				z->start, z->start >> 9, z->wp, z->wp >> 9);
+		}
 		return ret;
+	}
 
 	for (z = zb; z < ze; z++) {
+		assert(z->wp != (uint64_t)-1);
 		pthread_mutex_lock(&z->mutex);
 		pthread_mutex_lock(&f->zbd_info->mutex);
 		f->zbd_info->sectors_with_data -= z->wp - z->start;
@@ -675,13 +721,15 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 	uint32_t zone_idx_b, zone_idx_e;
 	struct fio_zone_info *zb, *ze, *z;
 	int ret = 0;
+	enum zbd_zone_pr zpr;
 
 	zone_idx_b = zbd_zone_idx(f, offset);
 	zb = &f->zbd_info->zone_info[zone_idx_b];
 	zone_idx_e = zbd_zone_idx(f, offset + length);
 	ze = &f->zbd_info->zone_info[zone_idx_e];
 	for (z = zb; z < ze; z++) {
-		if (!f->zbd_info->can_process_zone(DDIR_WRITE, z)) {
+		zpr = zbd_zone_io_allowed(td, f, DDIR_WRITE, z);
+		if (zpr == ZBD_IO_NONE) {
 			if (zb < z) {
 				ret = zbd_reset_cont_range(td, f, zb, z,
 							   pidx);
@@ -698,13 +746,6 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 	}
 
 	return ret;
-}
-
-
-static unsigned int zbd_zone_nr(struct zoned_block_device_info *zbd_info,
-				struct fio_zone_info *zone)
-{
-	return zone - (struct fio_zone_info *)zbd_info->zone_info;
 }
 
 /**
@@ -742,12 +783,12 @@ static int zbd_reset_zones(struct thread_data *td, struct fio_file *f,
 	bool reset_wp;
 	int res = 0;
 
-	dprint(FD_ZBD, "%s: examining zones %u .. %u\n", f->file_name,
-		zbd_zone_nr(f->zbd_info, zb), zbd_zone_nr(f->zbd_info, ze));
+	dprint(FD_ZBD, "%s: examining zones %u .. %u%s\n", f->file_name,
+		zbd_zone_nr(f->zbd_info, zb), zbd_zone_nr(f->zbd_info, ze),
+		all_zones ? " (all)" : "");
 	for (z = zb; z < ze; z++) {
 		pthread_mutex_lock(&z->mutex);
-		switch (z->type) {
-		case BLK_ZONE_TYPE_SEQWRITE_REQ:
+		if (zbd_wp_zone(f, z)) {
 			reset_wp = all_zones ? z->wp != z->start :
 					(td->o.td_ddir & TD_DDIR_WRITE) &&
 					z->wp % min_bs != 0;
@@ -764,18 +805,15 @@ static int zbd_reset_zones(struct thread_data *td, struct fio_file *f,
 					res = 1;
 				start_z = ze;
 			}
-			break;
-		default:
-			if (start_z == ze)
-				break;
+		} else if (start_z != ze) {
 			dprint(FD_ZBD, "%s: resetting zones %u .. %u\n",
 			       f->file_name, zbd_zone_nr(f->zbd_info, start_z),
 			       zbd_zone_nr(f->zbd_info, z));
 			if (zbd_reset_range(td, f, start_z->start,
 					    z->start - start_z->start) < 0)
 				res = 1;
+
 			start_z = ze;
-			break;
 		}
 	}
 	if (start_z < ze) {
@@ -935,7 +973,7 @@ static bool zbd_open_zone(struct thread_data *td, const struct io_u *io_u,
 	struct fio_zone_info *z = &f->zbd_info->zone_info[zone_idx];
 	bool res = true;
 
-	if (!f->zbd_info->can_process_zone(DDIR_WRITE, z))
+	if (zbd_zone_io_allowed(td, f, DDIR_WRITE, z) == ZBD_IO_NONE)
 		return false;
 
 	/*
@@ -955,7 +993,8 @@ static bool zbd_open_zone(struct thread_data *td, const struct io_u *io_u,
 	res = false;
 	if (f->zbd_info->num_open_zones >= td->o.max_open_zones)
 		goto out;
-	dprint(FD_ZBD, "%s: opening zone %d\n", f->file_name, zone_idx);
+	dprint(FD_ZBD, "%s: opening zone %d, wp=%lu\n",
+	       f->file_name, zone_idx, z->wp >> 9);
 	f->zbd_info->open_zones[f->zbd_info->num_open_zones++] = zone_idx;
 	z->open = 1;
 	res = true;
@@ -1145,27 +1184,46 @@ zbd_find_zone(struct thread_data *td, struct io_u *io_u,
 	struct fio_zone_info *z1, *z2;
 	const struct fio_zone_info *const zf =
 		&f->zbd_info->zone_info[zbd_zone_idx(f, f->file_offset)];
+	enum zbd_zone_pr zpr;
 
 	/*
 	 * Skip to the next non-empty zone in case of sequential I/O and to
 	 * the nearest non-empty zone in case of random I/O.
 	 */
 	for (z1 = zb + 1, z2 = zb - 1; z1 < zl || z2 >= zf; z1++, z2--) {
-		if (z1 < zl &&
-		    f->zbd_info->can_process_zone(io_u->ddir, z1)) {
-			pthread_mutex_lock(&z1->mutex);
-			if (z1->start + min_bs <= z1->wp)
-				return z1;
-			pthread_mutex_unlock(&z1->mutex);
+		if (z1 < zl) {
+			zpr = zbd_zone_io_allowed(td, f, io_u->ddir, z1);
+			if (zpr != ZBD_IO_NONE) {
+				pthread_mutex_lock(&z1->mutex);
+				switch (zpr) {
+				case ZBD_IO_AT_WP:
+					if (z1->start + min_bs <= z1->wp)
+						return z1;
+				case ZBD_IO_ANY:
+				case ZBD_IO_BELOW_WP:
+					return z1;
+				default:;
+				}
+				pthread_mutex_unlock(&z1->mutex);
+			}
 		} else if (!td_random(td)) {
 			break;
 		}
-		if (td_random(td) && z2 >= zf &&
-		    f->zbd_info->can_process_zone(io_u->ddir, z2)) {
-			pthread_mutex_lock(&z2->mutex);
-			if (z2->start + min_bs <= z2->wp)
-				return z2;
-			pthread_mutex_unlock(&z2->mutex);
+		if (td_random(td) && z2 >= zf) {
+			zpr = zbd_zone_io_allowed(td, f, io_u->ddir, z2);
+			if (zpr != ZBD_IO_NONE) {
+				pthread_mutex_lock(&z2->mutex);
+				switch (zpr) {
+				case ZBD_IO_AT_WP:
+					if (z1->start + min_bs <= z1->wp)
+						return z1;
+				case ZBD_IO_ANY:
+				case ZBD_IO_BELOW_WP:
+					return z1;
+				default:;
+				}
+				pthread_mutex_unlock(&z2->mutex);
+			}
 		}
 	}
 	dprint(FD_ZBD, "%s: adjusting random read offset failed\n",
@@ -1184,26 +1242,29 @@ zbd_find_zone(struct thread_data *td, struct io_u *io_u,
  */
 static void zbd_post_submit(const struct io_u *io_u, bool success)
 {
+	const struct fio_file *f = io_u->file;
 	struct zoned_block_device_info *zbd_info;
 	struct fio_zone_info *z;
 	uint32_t zone_idx;
-	uint64_t end, zone_end;
+	uint64_t end, adj_end, zone_end;
 
-	zbd_info = io_u->file->zbd_info;
+	zbd_info = f->zbd_info;
 	if (!zbd_info)
 		return;
 
-	zone_idx = zbd_zone_idx(io_u->file, io_u->offset);
-	end = io_u->offset + io_u->buflen;
-	z = &zbd_info->zone_info[zone_idx];
+	zone_idx = zbd_zone_idx(f, io_u->offset);
 	assert(zone_idx < zbd_info->nr_zones);
-	if (z->type != BLK_ZONE_TYPE_SEQWRITE_REQ)
+	z = &zbd_info->zone_info[zone_idx];
+	if (!zbd_wp_zone(f, z))
 		return;
 	if (!success)
 		goto unlock;
 	switch (io_u->ddir) {
 	case DDIR_WRITE:
-		zone_end = min(end, (z + 1)->start);
+		end = io_u->offset + io_u->buflen;
+		/* I/O could have started below the write pointer */
+		adj_end = max(end, z->wp);
+		zone_end = min(adj_end, (z + 1)->start);
 		pthread_mutex_lock(&zbd_info->mutex);
 		/*
 		 * z->wp > zone_end means that one or more I/O errors
@@ -1254,6 +1315,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 	uint32_t min_bs = td->o.min_bs[io_u->ddir];
 	uint64_t new_len;
 	int64_t range;
+	enum zbd_zone_pr zpr;
 
 	if (!f->zbd_info)
 		return io_u_accept;
@@ -1265,15 +1327,12 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 	orig_zb = zb;
 
 	/*
-	 * For online zones, accept the I/O offset for reads if reading
-	 * beyond the write pointer is enabled. Accept the I/O offset
-	 * for conventional zones.
+	 * Find out about write pointer restrictions for this zone.
+	 * Accept the i/o if there are none.
 	 */
-	if (f->zbd_info->can_process_zone(io_u->ddir, zb)) {
-	    if (zb->type == BLK_ZONE_TYPE_CONVENTIONAL ||
-	        (io_u->ddir == DDIR_READ && td->o.read_beyond_wp))
-			return io_u_accept;
-	}
+	zpr = zbd_zone_io_allowed(td, f, io_u->ddir, zb);
+	if (zpr == ZBD_IO_ANY)
+		return io_u_accept;
 
 	zbd_check_swd(f);
 
@@ -1289,8 +1348,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		 * I/O of at least min_bs B. If there isn't, find a new zone for
 		 * the I/O.
 		 */
-		range = f->zbd_info->can_process_zone(io_u->ddir, zb) ?
-			zb->wp - zb->start : 0;
+		range = (zpr != ZBD_IO_NONE) ? zb->wp - zb->start : 0;
 		if (range < min_bs ||
 		    ((!td_random(td)) && (io_u->offset + min_bs > zb->wp))) {
 			pthread_mutex_unlock(&zb->mutex);
@@ -1339,7 +1397,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		assert(io_u->offset + io_u->buflen <= zb->wp);
 		goto accept;
 	case DDIR_WRITE:
-		if (!f->zbd_info->can_process_zone(DDIR_WRITE, zb)) {
+		if (zpr == ZBD_IO_NONE) {
 			pthread_mutex_unlock(&zb->mutex);
 			zl = &f->zbd_info->zone_info[zbd_zone_idx(f,
 						f->file_offset + f->io_size)];
@@ -1352,6 +1410,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 				goto eof;
 			}
 			zone_idx_b = zbd_zone_nr(f->zbd_info, zb);
+			zpr = zbd_zone_io_allowed(td, f, DDIR_WRITE, zb);
 		}
 		if (io_u->buflen > f->zbd_info->zone_size)
 			goto eof;
@@ -1386,11 +1445,17 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 				goto eof;
 		}
 		/* Make writes occur at the write pointer */
-		assert(!zbd_zone_full(f, zb, min_bs));
-		if (zb->type == BLK_ZONE_TYPE_CONVENTIONAL)
+		if (zpr == ZBD_IO_ANY) {
 			io_u->offset = zb->start;
-		else
+		} else if (ZBD_IO_BELOW_WP) {
+			if (zbd_zone_full(f, zb, min_bs))
+				io_u->offset = zb->start;
+			else
+				io_u->offset = zb->wp;
+		} else {
+			assert(zbd_zone_full(f, zb, min_bs));
 			io_u->offset = zb->wp;
+		}
 		if (!is_valid_offset(f, io_u->offset)) {
 			dprint(FD_ZBD, "Dropped request with offset %llu\n",
 			       io_u->offset);
@@ -1431,7 +1496,7 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 
 accept:
 	assert(zb);
-	assert(f->zbd_info->can_process_zone(io_u->ddir, zb));
+	assert(zbd_zone_io_allowed(td, f, io_u->ddir, zb) != ZBD_IO_NONE);
 	assert(!io_u->post_submit);
 	io_u->post_submit = zbd_post_submit;
 	return io_u_accept;

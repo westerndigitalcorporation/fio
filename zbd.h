@@ -29,6 +29,30 @@ enum io_u_action {
 	io_u_eof	= 1,
 };
 
+/*
+ * Zone processing restrictions. These tell how a zone with a particular
+ * type and condition is allowed to be read or written.
+ */
+enum zbd_zone_pr {
+	/* The i/o op can be performed anywhere in the zone */
+	ZBD_IO_ANY,
+
+	/*
+	 * The starting offset for the op can only
+	 * reside BELOW OR AT the write pointer
+	 */
+	ZBD_IO_BELOW_WP,
+
+	/*
+	 * The starting offset for the op can only
+	 * be placed EXACTLY at the write pointer
+	 */
+	ZBD_IO_AT_WP,
+
+	/* The requested i/o op is not allowed anywhere in the zone */
+	ZBD_IO_NONE,
+};
+
 /**
  * struct fio_zone_info - information about a single ZBD zone
  * @start: zone start location (bytes)
@@ -80,14 +104,23 @@ struct fio_zone_info {
  * will be smaller than 'zone_size'.
  */
 struct zoned_block_device_info {
+#if defined(CONFIG_LINUX_BLKZONED) && !defined(CONFIG_LIBZBC)
 	enum blk_zoned_model	model;
+#else
+	uint8_t			model;
+#endif
 	pthread_mutex_t		mutex;
+
 	int			(*reset_zones)(struct thread_data *td,
 					       const struct fio_file *f,
 					       uint64_t offset,
 					       uint64_t length);
-	bool			(*can_process_zone)(enum fio_ddir dir,
-						    struct fio_zone_info *z);
+	enum zbd_zone_pr	(*zone_io_allowed)(struct thread_data *td,
+						   const struct fio_file *f,
+						   enum fio_ddir dir,
+						   struct fio_zone_info *z);
+	bool			(*wp_zone)(struct fio_zone_info *z);
+
 	uint64_t		zone_size;
 	uint64_t		sectors_with_data;
 	uint32_t		zone_size_log2;
@@ -98,6 +131,27 @@ struct zoned_block_device_info {
 	uint32_t		open_zones[FIO_MAX_OPEN_ZBD_ZONES];
 	struct fio_zone_info	zone_info[0];
 };
+
+static inline int zbd_zone_reset(struct thread_data *td,
+				 const struct fio_file *f, uint64_t offset,
+				 uint64_t length)
+{
+	return f->zbd_info->reset_zones(td, f, offset, length);
+}
+
+static inline
+enum zbd_zone_pr zbd_zone_io_allowed(struct thread_data *td,
+				const struct fio_file *f, enum fio_ddir dir,
+				struct fio_zone_info *z)
+{
+	return f->zbd_info->zone_io_allowed(td, f, dir, z);
+}
+
+static inline bool zbd_wp_zone(const struct fio_file *f,
+			       struct fio_zone_info *z)
+{
+	return f->zbd_info->wp_zone(z);
+}
 
 #if defined(CONFIG_LINUX_BLKZONED) || defined(CONFIG_LIBZBC)
 int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
