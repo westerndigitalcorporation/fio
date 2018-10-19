@@ -12,7 +12,9 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef CONFIG_LINUX_BLKZONED
 #include <linux/blkzoned.h>
+#endif
 #include "file.h"
 #include "fio.h"
 #include "lib/pow2.h"
@@ -185,6 +187,67 @@ static bool zbd_verify_bs(void)
 	return true;
 }
 
+static int ilog2(uint64_t i)
+{
+	int log = -1;
+
+	while (i) {
+		i >>= 1;
+		log++;
+	}
+	return log;
+}
+
+/*
+ * Initialize f->zbd_info for devices that are not zoned block devices. This
+ * allows to execute a ZBD workload against a non-ZBD device.
+ */
+int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
+		       uint32_t nr_zones)
+{
+	struct fio_zone_info *p;
+	uint64_t zone_size;
+	struct zoned_block_device_info *zbd_info = NULL;
+	pthread_mutexattr_t attr;
+	int i;
+
+	zone_size = td->o.zone_size;
+	assert(zone_size);
+	if (!nr_zones)
+		nr_zones = (f->real_file_size + zone_size - 1) / zone_size;
+	zbd_info = scalloc(1, sizeof(*zbd_info) +
+			   (nr_zones + 1) * sizeof(zbd_info->zone_info[0]));
+	if (!zbd_info)
+		return -ENOMEM;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutexattr_setpshared(&attr, true);
+	pthread_mutex_init(&zbd_info->mutex, &attr);
+	zbd_info->refcount = 1;
+	p = &zbd_info->zone_info[0];
+	for (i = 0; i < nr_zones; i++, p++) {
+		pthread_mutex_init(&p->mutex, &attr);
+		p->start = i * zone_size;
+		p->wp = p->start + zone_size;
+#ifdef CONFIG_LINUX_BLKZONED
+		p->type = BLK_ZONE_TYPE_SEQWRITE_REQ;
+		p->cond = BLK_ZONE_COND_EMPTY;
+#endif
+	}
+	/* a sentinel */
+	p->start = nr_zones * zone_size;
+
+	f->zbd_info = zbd_info;
+	f->zbd_info->zone_size = zone_size;
+	f->zbd_info->zone_size_log2 = is_power_of_2(zone_size) ?
+		ilog2(zone_size) : -1;
+	f->zbd_info->nr_zones = nr_zones;
+	pthread_mutexattr_destroy(&attr);
+	return 0;
+}
+
+#ifdef CONFIG_LINUX_BLKZONED
 /*
  * Read zone information into @buf starting from sector @start_sector.
  * @fd is a file descriptor that refers to a block device and @bufsz is the
@@ -252,64 +315,6 @@ out:
 	free(model_str);
 	free(zoned_attr_path);
 	return model;
-}
-
-static int ilog2(uint64_t i)
-{
-	int log = -1;
-
-	while (i) {
-		i >>= 1;
-		log++;
-	}
-	return log;
-}
-
-/*
- * Initialize f->zbd_info for devices that are not zoned block devices. This
- * allows to execute a ZBD workload against a non-ZBD device.
- */
-int zbd_init_zone_info(struct thread_data *td, struct fio_file *f,
-		       uint32_t nr_zones)
-{
-	struct fio_zone_info *p;
-	uint64_t zone_size;
-	struct zoned_block_device_info *zbd_info = NULL;
-	pthread_mutexattr_t attr;
-	int i;
-
-	zone_size = td->o.zone_size;
-	assert(zone_size);
-	if (!nr_zones)
-		nr_zones = (f->real_file_size + zone_size - 1) / zone_size;
-	zbd_info = scalloc(1, sizeof(*zbd_info) +
-			   (nr_zones + 1) * sizeof(zbd_info->zone_info[0]));
-	if (!zbd_info)
-		return -ENOMEM;
-
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-	pthread_mutexattr_setpshared(&attr, true);
-	pthread_mutex_init(&zbd_info->mutex, &attr);
-	zbd_info->refcount = 1;
-	p = &zbd_info->zone_info[0];
-	for (i = 0; i < nr_zones; i++, p++) {
-		pthread_mutex_init(&p->mutex, &attr);
-		p->start = i * zone_size;
-		p->wp = p->start + zone_size;
-		p->type = BLK_ZONE_TYPE_SEQWRITE_REQ;
-		p->cond = BLK_ZONE_COND_EMPTY;
-	}
-	/* a sentinel */
-	p->start = nr_zones * zone_size;
-
-	f->zbd_info = zbd_info;
-	f->zbd_info->zone_size = zone_size;
-	f->zbd_info->zone_size_log2 = is_power_of_2(zone_size) ?
-		ilog2(zone_size) : -1;
-	f->zbd_info->nr_zones = nr_zones;
-	pthread_mutexattr_destroy(&attr);
-	return 0;
 }
 
 /*
@@ -538,23 +543,6 @@ int zbd_create_zone_info(struct thread_data *td, struct fio_file *f)
 	return ret;
 }
 
-void zbd_free_zone_info(struct fio_file *f)
-{
-	uint32_t refcount;
-
-	if (!f->zbd_info)
-		return;
-
-	pthread_mutex_lock(&f->zbd_info->mutex);
-	refcount = --f->zbd_info->refcount;
-	pthread_mutex_unlock(&f->zbd_info->mutex);
-
-	assert((int32_t)refcount >= 0);
-	if (refcount == 0)
-		sfree(f->zbd_info);
-	f->zbd_info = NULL;
-}
-
 /*
  * Initialize f->zbd_info.
  *
@@ -587,6 +575,24 @@ static int init_zone_info(struct thread_data *td, struct fio_file *file)
 		td_verror(td, -ret, "BLKREPORTZONE failed");
 	return ret;
 }
+#endif
+
+void zbd_free_zone_info(struct fio_file *f)
+{
+	uint32_t refcount;
+
+	if (!f->zbd_info)
+		return;
+
+	pthread_mutex_lock(&f->zbd_info->mutex);
+	refcount = --f->zbd_info->refcount;
+	pthread_mutex_unlock(&f->zbd_info->mutex);
+
+	assert((int32_t)refcount >= 0);
+	if (refcount == 0)
+		sfree(f->zbd_info);
+	f->zbd_info = NULL;
+}
 
 int zbd_init(struct thread_data *td)
 {
@@ -603,6 +609,7 @@ int zbd_init(struct thread_data *td)
 				f->file_name);
 			return 1;
 		}
+#ifdef CONFIG_LINUX_BLKZONED
 		if (td->o.zone_size == 0 &&
 		    get_zbd_model(f->file_name) == ZBD_DM_NONE) {
 			log_err("%s: Specifying the zone size is mandatory for regular block devices with --zonemode=zbd\n\n",
@@ -611,6 +618,7 @@ int zbd_init(struct thread_data *td)
 		}
 
 		init_zone_info(td, f);
+#endif
 	}
 
 	if (!zbd_using_direct_io()) {
@@ -993,8 +1001,7 @@ static bool zbd_open_zone(struct thread_data *td, const struct io_u *io_u,
 	res = false;
 	if (f->zbd_info->num_open_zones >= td->o.max_open_zones)
 		goto out;
-	dprint(FD_ZBD, "%s: opening zone %d, wp=%lu\n",
-	       f->file_name, zone_idx, z->wp >> 9);
+	dprint(FD_ZBD, "%s: opening zone %d\n", f->file_name, zone_idx);
 	f->zbd_info->open_zones[f->zbd_info->num_open_zones++] = zone_idx;
 	z->open = 1;
 	res = true;
@@ -1246,7 +1253,7 @@ static void zbd_post_submit(const struct io_u *io_u, bool success)
 	struct zoned_block_device_info *zbd_info;
 	struct fio_zone_info *z;
 	uint32_t zone_idx;
-	uint64_t end, adj_end, zone_end;
+	uint64_t end, zone_end;
 
 	zbd_info = f->zbd_info;
 	if (!zbd_info)
@@ -1263,8 +1270,8 @@ static void zbd_post_submit(const struct io_u *io_u, bool success)
 	case DDIR_WRITE:
 		end = io_u->offset + io_u->buflen;
 		/* I/O could have started below the write pointer */
-		adj_end = max(end, z->wp);
-		zone_end = min(adj_end, (z + 1)->start);
+		end = max(end, z->wp);
+		zone_end = min(end, (z + 1)->start);
 		pthread_mutex_lock(&zbd_info->mutex);
 		/*
 		 * z->wp > zone_end means that one or more I/O errors
