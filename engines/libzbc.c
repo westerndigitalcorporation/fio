@@ -29,8 +29,9 @@ struct libzbc_options {
 	void *pad;
 	unsigned int force_ata;
 	unsigned int libzbc_debug;
-	unsigned int libzbc_eng_dbg;
+	unsigned int engine_dbg;
 	unsigned int skip_all;
+	unsigned int use_urswrz;
 };
 
 static struct fio_option options[] = {
@@ -58,19 +59,29 @@ static struct fio_option options[] = {
 		.name	= "libzbc_eng_dbg",
 		.lname	= "libzbc ioengine debug",
 		.type	= FIO_OPT_BOOL,
-		.off1	= offsetof(struct libzbc_options, libzbc_eng_dbg),
+		.off1	= offsetof(struct libzbc_options, engine_dbg),
 		.help	= "turn on/off libzbc ioengine debug",
 		.def	= "0",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_LIBZBC,
 	},
 	{
-		.name	= "skip_all",
+		.name	= "libzbc_skip_all",
 		.lname	= "skip all inactive zones",
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct libzbc_options, skip_all),
 		.help	= "for ZD, skip inactive zones at the bottom",
 		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBZBC,
+	},
+	{
+		.name	= "libzbc_urswrz",
+		.lname	= "use device unrestricted read setting",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct libzbc_options, use_urswrz),
+		.help	= "turn off to manually set read_beyond_wp flag",
+		.def	= "1",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_LIBZBC,
 	},
@@ -159,7 +170,7 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 	 * some compatibility problems as this is a ZBC-2 feature.
 	 */
 	for (i = 0; i < length; i++, offset += zone_blksz) {
-		if (o->libzbc_eng_dbg)
+		if (o->engine_dbg)
 			dprint(FD_ZBD, "Reset %lu\n", offset);
 		ret = zbc_reset_zone(ld->zdev, offset, 0);
 		if (ret) {
@@ -257,9 +268,14 @@ static bool libzbc_wp_zone_zd(struct fio_zone_info *z)
 	return true;
 }
 
+static inline bool libzbc_no_wp(uint64_t wp)
+{
+	return (wp & 0x7fffffffffffff) == 0x7fffffffffffff;
+}
+
 static void libzbc_print_zone(unsigned int num, struct fio_zone_info *p)
 {
-	if (p->wp == (uint64_t)-1) {
+	if (libzbc_no_wp(p->wp)) {
 		dprint(FD_ZBD,
 			"%05u S:%012lu/%010lu T:%u(%s) C:%u(%s)\n",
 			num, p->start, p->start >> 9, p->type,
@@ -290,17 +306,17 @@ static void libzbc_read_zone_info(struct thread_data *td,
 		p->start = (z->zbz_start - ld->first_active) << 9;
 		if (zbc_zone_full(z))
 			p->wp = p->start + td->o.zone_size;
-		else if (z->zbz_write_pointer != (uint64_t)-1)
-			p->wp = (z->zbz_write_pointer - ld->first_active) << 9;
 		else if (zbc_zone_conventional(z))
 			p->wp = p->start;
+		else if (!libzbc_no_wp(z->zbz_write_pointer))
+			p->wp = (z->zbz_write_pointer - ld->first_active) << 9;
 		else
-			p->wp = z->zbz_write_pointer;
+			p->wp = (uint64_t)-1;
 		p->type = z->zbz_type;
 		p->cond = z->zbz_condition;
 	}
 
-	if (o->libzbc_eng_dbg) {
+	if (o->engine_dbg) {
 		dprint(FD_ZBD, "%s: ----- zone info -----\n",
 		       f->file_name);
 		for (i = 0; i < nr_zones; i++, zi++)
@@ -362,9 +378,11 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	if (o->libzbc_debug)
 		zbc_set_log_level("debug");
 
-	dprint(FD_ZBD, "libzbc_debug=%i\n", o->libzbc_debug);
-	dprint(FD_ZBD, "libzbc_eng_dbg=%i\n", o->libzbc_eng_dbg);
-	dprint(FD_ZBD, "force_ata=%i\n", o->force_ata);
+	dprint(FD_ZBD, "%s: libzbc_debug=%i\n", f->file_name, o->libzbc_debug);
+	dprint(FD_ZBD, "%s: libzbc_eng_dbg=%i\n", f->file_name, o->engine_dbg);
+	dprint(FD_ZBD, "%s: libzbc_ata=%i\n", f->file_name, o->force_ata);
+	dprint(FD_ZBD, "%s: libzbc_skip_all=%i\n", f->file_name, o->skip_all);
+	dprint(FD_ZBD, "%s: libzbc_urswrz=%i\n", f->file_name, o->use_urswrz);
 
 	if (!o->force_ata)
 		flags = ZBC_O_DRV_BLOCK | ZBC_O_DRV_SCSI | ZBC_O_DRV_ATA;
@@ -377,7 +395,7 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	zbc_get_device_info(ld->zdev, &ld->info);
 	info = &ld->info;
 
-	dprint(FD_ZBD, "(%s)vendor_id:%s, type: %s, model: %s\n",
+	dprint(FD_ZBD, "%s: vendor_id:%s, type: %s, model: %s\n",
 	       f->file_name, ld->info.zbd_vendor_id,
 	       zbc_device_type_str(info->zbd_type),
 	       zbc_device_model_str(info->zbd_model));
@@ -443,7 +461,10 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 
 		free(zones);
 
-		if (!(info->zbd_flags & ZBC_UNRESTRICTED_READ)) {
+		if (o->use_urswrz) {
+			td->o.read_beyond_wp =
+				info->zbd_flags & ZBC_UNRESTRICTED_READ;
+		} else if (!(info->zbd_flags & ZBC_UNRESTRICTED_READ)) {
 			if (td->o.read_beyond_wp) {
 				dprint(FD_ZBD,
 				       "%s doesn't support reads beyond WP\n",
@@ -451,9 +472,27 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 				td->o.read_beyond_wp = false;
 			}
 		}
+		dprint(FD_ZBD, "%s: read_beyond_wp=%u\n",
+		       f->file_name, td->o.read_beyond_wp);
 
 		f->filetype = FIO_TYPE_BLOCK;
-		f->zbd_info->model = info->zbd_model;
+		if (zd && info->zbd_model != ZBC_DM_HOST_MANAGED &&
+		    info->zbd_model != ZBC_DM_HOST_AWARE)
+			f->zbd_info->model = ZBC_DM_HOST_MANAGED;
+		else
+			f->zbd_info->model = info->zbd_model;
+
+		if (info->zbd_model == ZBC_DM_HOST_MANAGED &&
+		    info->zbd_max_nr_open_seq_req != (uint32_t)-1)
+			td->o.max_open_zones = info->zbd_max_nr_open_seq_req;
+		else if (info->zbd_model == ZBC_DM_HOST_AWARE &&
+			 info->zbd_opt_nr_open_seq_pref != (uint32_t)-1)
+			td->o.max_open_zones = info->zbd_opt_nr_open_seq_pref;
+		dprint(FD_ZBD, "%s: set zbd_model %u(%s) and max_open_zones %u\n",
+		       f->file_name, f->zbd_info->model,
+		       zbc_device_model_str(f->zbd_info->model),
+		       td->o.max_open_zones);
+
 		f->zbd_info->reset_zones = libzbc_reset_zones;
 		f->zbd_info->zone_io_allowed = zd ? libzbc_zone_io_allowed_zd :
 						     libzbc_zone_io_allowed;
