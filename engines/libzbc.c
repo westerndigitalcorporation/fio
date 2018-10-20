@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <libzbc/zbc.h>
 
+#include "../smalloc.h"
 #include "../fio.h"
 #include "../optgroup.h"
 #include "../zbd.h"
@@ -144,14 +145,6 @@ static enum fio_q_status fio_libzbc_queue(struct thread_data *td,
 	return FIO_Q_COMPLETED;
 }
 
-static void fio_libzbc_cleanup(struct thread_data *td)
-{
-	struct libzbc_data *ld = td->io_ops_data;
-
-	if (ld)
-		free(ld);
-}
-
 static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 			      uint64_t offset, uint64_t length)
 {
@@ -171,7 +164,7 @@ static int libzbc_reset_zones(struct thread_data *td, const struct fio_file *f,
 	 */
 	for (i = 0; i < length; i++, offset += zone_blksz) {
 		if (o->engine_dbg)
-			dprint(FD_ZBD, "Reset %lu\n", offset);
+			dprint(FD_ZBD, "%s: reset %lu\n", f->file_name, offset);
 		ret = zbc_reset_zone(ld->zdev, offset, 0);
 		if (ret) {
 			td_verror(td, errno, "resetting wp failed");
@@ -367,11 +360,17 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	bool zoned, zd;
 
 	ld = FILE_ENG_DATA(f);
-	if (ld)
+	if (ld) {
+		if (o->engine_dbg) {
+			dprint(FD_ZBD,
+			       "LD %p already set for file %p (%s)\n",
+			       ld, f, f->file_name);
+		}
 		return 0;
+	}
 
 	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
-	ld = calloc(1, sizeof(*ld));
+	ld = scalloc(1, sizeof(*ld));
 	if (!ld)
 		return -ENOMEM;
 
@@ -389,8 +388,11 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	else
 		flags = ZBC_O_DRV_ATA;
 	ret = zbc_open(f->file_name, flags, &ld->zdev);
-	if (ret)
-		return ret;
+	if (ret) {
+		log_err("%s: zbc_open() failed, err=%i\n",
+			f->file_name, ret);
+		goto err;
+	}
 
 	zbc_get_device_info(ld->zdev, &ld->info);
 	info = &ld->info;
@@ -411,7 +413,7 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 		if (ret || !zones) {
 			log_err("%s: REPORT ZONES failed, err=%i\n",
 				f->file_name, ret);
-			return ret;
+			goto err;
 		}
 		td->o.zone_size = zones->zbz_length << 9;
 
@@ -452,14 +454,14 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 			td_verror(td, errno, "init zone info failed");
 			log_err("%s: zone info initialization failed (%d)\n",
 				f->file_name, ret);
-			free(zones);
-			return ret;
+			goto err;
 		}
 
 		libzbc_read_zone_info(td, f, ld, zones, nr_zones);
 		nr_zones -= start;
 
 		free(zones);
+		zones = NULL;
 
 		if (o->use_urswrz) {
 			td->o.read_beyond_wp =
@@ -506,8 +508,14 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 	       f->file_name, f->real_file_size);
 
 	FILE_SET_ENG_DATA(f, ld);
-
 	return 0;
+
+err:
+	if (zones)
+		free(zones);
+	if (ld)
+		sfree(ld);
+	return ret;
 }
 
 static int fio_libzbc_open_file(struct thread_data *td, struct fio_file *f)
@@ -519,14 +527,21 @@ static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 				 struct fio_file *f)
 {
 	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	int ret;
 
 	if (!ld)
 		return 0;
-	if (ld->zdev)
-		zbc_close(ld->zdev);
+	if (ld->zdev) {
+		ret = zbc_close(ld->zdev);
+		if (ret) {
+			log_err("%s: zbc_close() failed with error %i\n",
+				f->file_name, ret);
+		}
+		ld->zdev = NULL;
+	}
 
 	FILE_SET_ENG_DATA(f, NULL);
-	free(ld);
+	sfree(ld);
 
 	return 0;
 }
@@ -540,7 +555,6 @@ static struct ioengine_ops ioengine = {
 	.name			= "libzbc",
 	.version		= FIO_IOOPS_VERSION,
 	.queue			= fio_libzbc_queue,
-	.cleanup		= fio_libzbc_cleanup,
 	.open_file		= fio_libzbc_open_file,
 	.close_file		= fio_libzbc_close_file,
 	.get_file_size		= fio_libzbc_get_file_size,
