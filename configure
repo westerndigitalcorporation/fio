@@ -2203,7 +2203,6 @@ cat > $TMPC << EOF
 #include <libzbc/zbc.h>
 int main(int argc, char **argv)
 {
-  zbc_version();
   return 0;
 }
 EOF

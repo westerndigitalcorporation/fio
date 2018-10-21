@@ -670,13 +670,12 @@ static int zbd_do_zone_reset(struct thread_data *td, const struct fio_file *f,
  * @f: Fio file for which to reset zones
  * @zb: first zone to reset.
  * @ze: first zone not to reset.
- * @pidx: The thread I/O data index for the priority used for reset command.
  *
  * Returns 0 upon success and a negative error code upon failure.
  */
 static int zbd_reset_cont_range(struct thread_data *td,
 			const struct fio_file *f, struct fio_zone_info *zb,
-			struct fio_zone_info *ze, int pidx)
+			struct fio_zone_info *ze)
 {
 	struct fio_zone_info *z;
 	int ret;
@@ -715,7 +714,6 @@ static int zbd_reset_cont_range(struct thread_data *td,
  * @f: Fio file for which to reset zones
  * @offset: Starting offset of the range in byte units
  * @length: Byte length of the range
- * @pidx: The thread I/O data index for the priority used for reset command.
  *
  * Reset range may contain zones that can't be reset or even accessed.
  * If necessary, break down the input range of zones to skip all such zones
@@ -724,7 +722,7 @@ static int zbd_reset_cont_range(struct thread_data *td,
  * Returns 0 upon success and a negative error code upon failure.
  */
 static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
-			   uint64_t offset, uint64_t length, int pidx)
+			   uint64_t offset, uint64_t length)
 {
 	uint32_t zone_idx_b, zone_idx_e;
 	struct fio_zone_info *zb, *ze, *z;
@@ -739,8 +737,7 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 		zpr = zbd_zone_io_allowed(td, f, DDIR_WRITE, z);
 		if (zpr == ZBD_IO_NONE) {
 			if (zb < z) {
-				ret = zbd_reset_cont_range(td, f, zb, z,
-							   pidx);
+				ret = zbd_reset_cont_range(td, f, zb, z);
 				if (ret)
 					return ret;
 			}
@@ -748,7 +745,7 @@ static int zbd_reset_range(struct thread_data *td, const struct fio_file *f,
 		}
 	}
 	if (zb < ze) {
-		ret = zbd_reset_cont_range(td, f, zb, ze, pidx);
+		ret = zbd_reset_cont_range(td, f, zb, ze);
 		if (ret)
 			return ret;
 	}
