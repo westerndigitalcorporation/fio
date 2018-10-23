@@ -322,11 +322,15 @@ static void libzbc_read_zone_info(struct thread_data *td,
 static int fio_libzbc_invalidate(struct thread_data *td, struct fio_file *f)
 {
 	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	struct libzbc_options *o = td->eo;
 	struct zbc_device_info *info = &ld->info;
 	struct zbc_zone *zones = NULL;
 	unsigned int nr_zones;
 	int ret;
 	bool zoned, zd;
+
+	if (o->engine_dbg)
+		dprint(FD_ZBD, "%s: %s\n", f->file_name, __func__);
 
 	zd = (info->zbd_flags & ZBC_ZONE_DOMAINS_SUPPORT);
 	zoned = info->zbd_model == ZBC_DM_HOST_MANAGED ||
@@ -369,7 +373,9 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 		return 0;
 	}
 
-	dprint(FD_ZBD, "libzbc_setup(%s)\n", f->file_name);
+	if (o->engine_dbg)
+		dprint(FD_ZBD, "%s: %s\n", f->file_name, __func__);
+
 	ld = scalloc(1, sizeof(*ld));
 	if (!ld)
 		return -ENOMEM;
@@ -420,9 +426,9 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 		if (zd) {
 			if (o->skip_all) {
 				/*
-				* Find the first zone that is not inactive
-				* or gap. We will skip all the zones before it
-				*/
+				 * Find the first zone that is not inactive
+				 * or gap. We will skip all the zones before it
+				 */
 				for (z = zones;
 				     start < nr_zones;
 				     z++, start++) {
@@ -442,12 +448,14 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 				if (!zbc_zone_inactive(z) && !zbc_zone_gap(z))
 					break;
 			}
-			f->real_file_size = (nr_zones - start) * td->o.zone_size;
+			f->real_file_size = (nr_zones - start) *
+					    td->o.zone_size;
 			ld->first_active = start * zones->zbz_length;
 			ld->start = start;
 		}
-		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB, first_active=%lu\n",
-		       f->file_name, nr_zones, td->o.zone_size, ld->first_active);
+		dprint(FD_ZBD, "%s: %u zones, zone_size=%lluB, first=%lu\n",
+		       f->file_name, nr_zones, td->o.zone_size,
+		       ld->first_active);
 
 		ret = zbd_init_zone_info(td, f, nr_zones - start);
 		if (ret) {
@@ -490,7 +498,8 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 		else if (info->zbd_model == ZBC_DM_HOST_AWARE &&
 			 info->zbd_opt_nr_open_seq_pref != (uint32_t)-1)
 			td->o.max_open_zones = info->zbd_opt_nr_open_seq_pref;
-		dprint(FD_ZBD, "%s: set zbd_model %u(%s) and max_open_zones %u\n",
+		dprint(FD_ZBD,
+		       "%s: set zbd_model %u(%s) and max_open_zones %u\n",
 		       f->file_name, f->zbd_info->model,
 		       zbc_device_model_str(f->zbd_info->model),
 		       td->o.max_open_zones);
@@ -500,11 +509,13 @@ static int libzbc_setup(struct thread_data *td, struct fio_file *f)
 						     libzbc_zone_io_allowed;
 		f->zbd_info->wp_zone = zd ? libzbc_wp_zone_zd :
 					    libzbc_wp_zone;
-		td->o.zone_mode = ZONE_MODE_ZBD;
+		if (o->engine_dbg)
+			dprint(FD_ZBD, "%s: got zone mode %u\n",
+			       f->file_name, td->o.zone_mode);
 	}
 
 	fio_file_set_size_known(f);
-	dprint(FD_ZBD, "file_size(%s)=%luB\n",
+	dprint(FD_ZBD, "%s: file_size=%luB\n",
 	       f->file_name, f->real_file_size);
 
 	FILE_SET_ENG_DATA(f, ld);
@@ -527,10 +538,15 @@ static int fio_libzbc_close_file(struct thread_data fio_unused *td,
 				 struct fio_file *f)
 {
 	struct libzbc_data *ld = FILE_ENG_DATA(f);
+	struct libzbc_options *o = td->eo;
 	int ret;
 
 	if (!ld)
 		return 0;
+
+	if (o->engine_dbg)
+		dprint(FD_ZBD, "%s: %s\n", f->file_name, __func__);
+
 	if (ld->zdev) {
 		ret = zbc_close(ld->zdev);
 		if (ret) {
