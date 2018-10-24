@@ -1214,7 +1214,7 @@ zbd_find_zone(struct thread_data *td, struct io_u *io_u,
 			break;
 		}
 		if (td_random(td) && z2 >= zf) {
-			zpr = zbd_zone_io_allowed(td, f, io_u->ddir, z2);
+			zpr = zbd_zone_io_allowed(td, f, io_u->ddir, z1);
 			if (zpr != ZBD_IO_NONE) {
 				pthread_mutex_lock(&z2->mutex);
 				switch (zpr) {
@@ -1352,7 +1352,11 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		 * I/O of at least min_bs B. If there isn't, find a new zone for
 		 * the I/O.
 		 */
-		range = (zpr != ZBD_IO_NONE) ? zb->wp - zb->start : 0;
+		if (zpr != ZBD_IO_NONE)
+			range = zbd_wp_zone(f, zb) ? zb->wp - zb->start :
+						     f->zbd_info->zone_size;
+		else
+			range = 0;
 		if (range < min_bs ||
 		    ((!td_random(td)) && (io_u->offset + min_bs > zb->wp))) {
 			pthread_mutex_unlock(&zb->mutex);
@@ -1368,10 +1372,16 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 			}
 			/*
 			 * zbd_find_zone() returned a zone with a range of at
-			 * least min_bs.
+			 * least min_bs. It might not always be a write pointer
+			 * zone.
 			 */
-			range = zb->wp - zb->start;
-			assert(range >= min_bs);
+			if (zbd_wp_zone(f, zb)) {
+				range = zb->wp - zb->start;
+				assert(range >= min_bs);
+			} else {
+				range = f->zbd_info->zone_size;
+			}
+			zpr = zbd_zone_io_allowed(td, f, DDIR_READ, zb);
 
 			if (!td_random(td))
 				io_u->offset = zb->start;
