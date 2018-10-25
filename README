@@ -1,3 +1,10 @@
+The current release branch is zone_domains_rc1. It is tested to conform to
+Zone Domains Rev.5 (T13 f18129r5) as implemented in tcmu-runner Zone Domains
+emulator (https://github.com/westerndigitalcorporation/tcmu-runner).
+
+TODO add more implementation notes here. Move these notes from the top to an
+appropriate section below when ready to merge to fio mainline.
+
 Overview and history
 --------------------
 
